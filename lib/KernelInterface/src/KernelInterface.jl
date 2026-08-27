@@ -18,5 +18,8 @@ include("backend.jl")
 include("device.jl")
 include("launch.jl")
 include("host.jl")
+# `caps.jl` after `matrix.jl`: `DeviceCaps` holds a `Vector{MatrixShape}`.
+include("matrix.jl")
+include("caps.jl")
 
 end

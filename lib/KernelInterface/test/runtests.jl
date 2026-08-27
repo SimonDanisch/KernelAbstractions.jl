@@ -40,6 +40,10 @@ end
         KI.argconvert, KI.kernel_function,
         # Host-side stubs: required backend methods with no sensible fallback.
         KI.synchronize, KI.copyto!,
+        # The one capability query everything in `caps.jl` derives from. A
+        # default here would be a plausible fake device, which is worse than a
+        # MethodError naming the backend that has not answered.
+        KI.caps,
     ]
     for stub in stubs
         @test isempty(methods(stub))
@@ -125,6 +129,134 @@ end
     # Pinning is optional and freeing is a no-op unless a backend does better.
     @test KI.pagelock!(b, zeros(2)) === missing
     @test KI.unsafe_free!(zeros(2)) === nothing
+end
+
+# One real card's cooperative-matrix table: four entries share `16x16x16` and
+# differ only in type, which is why `MatrixShape` carries `ab`/`acc` and why
+# matching on extents alone is wrong.
+const THISCARD = [
+    KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope()),
+    KI.MatrixShape(Float16, Float16, 16, 16, 16, KI.SubgroupScope()),
+    KI.MatrixShape(UInt8, Int32, 16, 16, 16, KI.SubgroupScope()),
+    KI.MatrixShape(Int8, Int32, 16, 16, 16, KI.SubgroupScope()),
+]
+
+# A backend with matrix hardware, for the queries that go through `caps`. Note it
+# answers ONE question — everything else derives, which is the point of putting
+# `DeviceCaps` here instead of in each backend.
+struct MatrixBackend <: KI.Backend end
+KI.caps(::MatrixBackend) = KI.DeviceCaps(
+    true, 16, 32, 32, 49152, 1024, 48, 48,
+    [(32, 16, 16, 16), (128, 32, 16, 16), (256, 32, 32, 16)], THISCARD
+)
+
+# The same device with cooperative matrices switched off, which is what a copy
+# with `coopmat = false` means. It still CARRIES the table.
+struct NoMatrixBackend <: KI.Backend end
+KI.caps(::NoMatrixBackend) = KI.DeviceCaps(KI.caps(MatrixBackend()); coopmat = false)
+
+@testset "MatrixShape equality and hashing are by value" begin
+    a = KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope())
+    b = KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope())
+    @test a == b
+    @test hash(a) == hash(b)
+    @test length(Set([a, b])) == 1
+    @test a != KI.MatrixShape(Float16, Float16, 16, 16, 16, KI.SubgroupScope())   # acc differs
+    @test a != KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.WorkgroupScope())  # scope differs
+
+    # `show` names the type pair, the extents and the scope, in that order.
+    @test sprint(show, a) == "MatrixShape(Float16->Float32 16x16x16 SubgroupScope)"
+end
+
+@testset "supports matches on type, not just extents" begin
+    @test KI.supports(THISCARD, KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope()))
+    # Same extents, a type combination the card does not list. Matching on
+    # (M,N,K) alone would say yes and emit instructions the device cannot run.
+    @test !KI.supports(THISCARD, KI.MatrixShape(Float32, Float32, 16, 16, 16, KI.SubgroupScope()))
+    @test !KI.supports(KI.MatrixShape[], KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope()))
+end
+
+@testset "bestshape" begin
+    @test KI.bestshape(THISCARD, Float16, Float32).M == 16
+    @test KI.bestshape(THISCARD, Int8, Int32).acc === Int32
+    # No matrix hardware, or no shape for this type pair: `nothing`, never a
+    # fabricated tile — the value is used as a divisor.
+    @test KI.bestshape(KI.MatrixShape[], Float16, Float32) === nothing
+    @test KI.bestshape(THISCARD, Float64, Float64) === nothing
+    @test KI.bestshape(THISCARD, Float16, Float32; scope = KI.WorkgroupScope()) === nothing
+end
+
+@testset "bestshape prefers square, then large" begin
+    mixed = [
+        KI.MatrixShape(Float16, Float32, 16, 8, 32, KI.SubgroupScope()),   # skewed
+        KI.MatrixShape(Float16, Float32, 8, 8, 8, KI.SubgroupScope()),     # square, small
+        KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope()),  # square, large
+    ]
+    @test KI.bestshape(mixed, Float16, Float32) == mixed[3]
+    # With no square option it still returns the least skewed rather than nothing.
+    skewed = [
+        KI.MatrixShape(Float16, Float32, 16, 8, 32, KI.SubgroupScope()),
+        KI.MatrixShape(Float16, Float32, 16, 8, 16, KI.SubgroupScope()),
+    ]
+    @test KI.bestshape(skewed, Float16, Float32) == skewed[2]
+end
+
+@testset "DeviceCaps" begin
+    c = KI.caps(MatrixBackend())
+
+    # Eight positional arguments still construct one, and they mean "no
+    # workgroup-scope matrices" plus "a square `tile` fp16 -> fp32 instruction" —
+    # so `tile` and `shapes` describe the same device rather than disagreeing.
+    eight = KI.DeviceCaps(true, 8, 32, 32, 32768, 1024, 20, 64)
+    @test isempty(eight.wggran)
+    @test eight.shapes == [KI.MatrixShape(Float16, Float32, 8, 8, 8, KI.SubgroupScope())]
+    @test isempty(KI.DeviceCaps(false, 0, 32, 32, 32768, 1024, 20, 64).shapes)
+
+    # A copy changes exactly the fields it names. `coopmat = false` in
+    # particular does NOT empty the table: naming one field and moving three is
+    # how a copy stops meaning what it says.
+    off = KI.DeviceCaps(c; coopmat = false)
+    @test off.coopmat === false
+    @test off.shapes === c.shapes          # untouched…
+    @test off.wggran === c.wggran
+    @test isempty(KI.matrix_shapes(off))   # …and the accessor still answers as
+                                           #    the device it claims to be
+    @test KI.DeviceCaps(c; subgroup = 64).subgroup == 64
+    @test KI.DeviceCaps(c; subgroup = 64).coopmatsubgroup == c.coopmatsubgroup
+
+    # Multiples coarsen as the workgroup grows, and a size with no row is
+    # `nothing` rather than a fabricated tile.
+    @test KI.wggranularity(c, 32) == (16, 16, 16)
+    @test KI.wggranularity(c, 128) == (32, 16, 16)
+    @test KI.wggranularity(c, 256) == (32, 32, 16)
+    @test KI.wggranularity(c, 64) === nothing
+    @test KI.wggranularity(KI.DeviceCaps(true, 16, 32, 32, 0, 1024, 0, 0), 32) === nothing
+end
+
+@testset "shape queries derive from caps" begin
+    fp16 = KI.MatrixShape(Float16, Float32, 16, 16, 16, KI.SubgroupScope())
+    fp32 = KI.MatrixShape(Float32, Float32, 16, 16, 16, KI.SubgroupScope())
+
+    # A backend answers `caps` and gets every one of these for free.
+    @test KI.matrix_shapes(MatrixBackend()) == THISCARD
+    @test KI.supports(MatrixBackend(), fp16)
+    @test !KI.supports(MatrixBackend(), fp32)
+    @test KI.bestshape(MatrixBackend(), Int8, Int32).acc === Int32
+    @test KI.bestshape(MatrixBackend(), Float16, Float32; scope = KI.WorkgroupScope()) === nothing
+
+    # With cooperative matrices off, every one of them says so — through the
+    # backend and through the caps, with the same answer.
+    @test KI.matrix_shapes(NoMatrixBackend()) == KI.MatrixShape[]
+    @test !KI.supports(NoMatrixBackend(), fp16)
+    @test KI.bestshape(NoMatrixBackend(), Float16, Float32) === nothing
+    off = KI.caps(NoMatrixBackend())
+    @test !KI.supports(off, fp16)
+    @test KI.bestshape(off, Float16, Float32) === nothing
+
+    # `caps` is required of a backend, not defaulted: one that has not answered
+    # it gets a MethodError rather than a plausible empty device.
+    @test_throws MethodError KI.caps(StubBackend())
+    @test_throws MethodError KI.matrix_shapes(StubBackend())
 end
 
 @testset "allocate / zeros / ones" begin

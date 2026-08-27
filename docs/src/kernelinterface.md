@@ -171,6 +171,45 @@ sub_group_size
 multiprocessor_count
 ```
 
+### Cooperative matrices
+
+The names a backend needs to describe what its matrix hardware can do. SPIR-V's
+`OpTypeCooperativeMatrixKHR`, CUDA's `wmma`, AMD's WMMA and Metal's
+`simdgroup_matrix` all expose the same three facts: which operand position a
+matrix occupies, whose registers hold it, and which `(M, N, K)` extents the
+device implements for a given type pair.
+
+This is a **vocabulary, not an interface**: there are deliberately no operations
+here, no load, store or multiply-accumulate. Those need a representation — an
+opaque handle on SPIR-V, a register tuple on CUDA, a builtin on Metal — and a
+dispatch story, and neither can be settled honestly against a single backend.
+
+```@docs
+MatrixUse
+MatrixA
+MatrixB
+Accumulator
+MatrixScope
+SubgroupScope
+WorkgroupScope
+MatrixShape
+matrix_shapes
+supports
+bestshape
+```
+
+### Device capabilities
+
+[`DeviceCaps`](@ref) is what a kernel has to know about the device it will run
+on, in terms every GPU has. A backend implements [`caps`](@ref) and everything
+else here derives from it.
+
+```@docs
+DeviceCaps
+caps
+wggranularity
+```
+
 ### Compilation and launching
 
 ```@docs
@@ -212,6 +251,10 @@ A backend must, at minimum:
 6. Report its limits through [`kernel_max_work_group_size`](@ref) and, where
    applicable, [`max_work_group_size`](@ref), [`sub_group_size`](@ref) and
    [`multiprocessor_count`](@ref).
+7. Implement [`caps`](@ref). [`matrix_shapes`](@ref), [`supports`](@ref),
+   [`bestshape`](@ref) and [`wggranularity`](@ref) all derive from it, so this
+   one answer covers the capability surface. A backend without cooperative
+   matrices reports `coopmat = false` and the rest follows.
 
 The PoCL backend in `src/pocl/backend.jl` is a complete worked example.
 
