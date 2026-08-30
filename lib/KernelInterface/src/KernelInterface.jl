@@ -21,5 +21,10 @@ include("host.jl")
 # `caps.jl` after `matrix.jl`: `DeviceCaps` holds a `Vector{MatrixShape}`.
 include("matrix.jl")
 include("caps.jl")
+# The cooperative-matrix type and the nine operations a backend lowers.
+include("coopmat.jl")
+# Graphics vocabulary a compiler and a backend both dispatch on, for the same
+# reason the matrix vocabulary is here.
+include("topology.jl")
 
 end

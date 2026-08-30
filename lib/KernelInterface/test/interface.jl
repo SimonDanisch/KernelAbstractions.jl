@@ -65,6 +65,19 @@ function shfl_down_test_kernel(a, b, ::Val{N}) where {N}
     return
 end
 
+function sub_group_reduce_add_test_kernel(a, b)
+    idx = KI.get_sub_group_local_id()
+
+    total = KI.sub_group_reduce_add(a[idx])
+
+    # Written from EVERY lane, not just the first. A reduction leaves the total
+    # on all of them, an inclusive scan leaves it only on the last, and checking
+    # one lane cannot tell those apart — which is the way a backend that wired
+    # the wrong `GroupOperation` would otherwise pass.
+    b[idx] = total
+    return
+end
+
 function interface_testsuite(backend, AT)
     @testset "Launch parameters" begin
         # 1d
@@ -213,6 +226,28 @@ function interface_testsuite(backend, AT)
 
                 b = Array(dev_b)
                 @test sum(a) ≈ b[1]
+            end
+        end
+    end
+
+    # Guarded on its own list rather than folded into the sub-group block above:
+    # the shuffle family and the reductions are separate capabilities, and a
+    # backend may implement either without the other.
+    if !isempty(KI.sub_group_reduce_add_types(backend()))
+        @testset "sub_group_reduce_add" begin
+            types_to_test = setdiff(KI.sub_group_reduce_add_types(backend()), [Bool])
+            @testset "$T" for T in types_to_test
+                N = KI.sub_group_size(backend())
+                a = zeros(T, N)
+                rand!(a, (0:1))
+
+                dev_a = AT(a)
+                dev_b = AT(zeros(T, N))
+
+                KI.@kernel backend() workgroupsize = N sub_group_reduce_add_test_kernel(dev_a, dev_b)
+
+                b = Array(dev_b)
+                @test all(≈(sum(a)), b)
             end
         end
     end

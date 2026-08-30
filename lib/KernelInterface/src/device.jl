@@ -212,6 +212,47 @@ shfl_down_types(::Backend) = DataType[]
 
 
 """
+    sub_group_reduce_add(val::T) where T
+
+Sum `val` across the sub-group and return the total on every lane.
+
+Here rather than left to each backend because a portable kernel cannot build it
+from [`shfl_down`](@ref) without giving up the hardware instruction: every
+backend has one — SPIR-V's `OpGroupNonUniformFAdd`/`IAdd` with a `Reduce`
+group operation, Metal's `simd_sum`, CUDA's `__reduce_add_sync` — and a
+log2(subgroup) shuffle loop in its place is slower for the one reduction that
+sits in the inner loop of every GEMV and every mapreduce.
+
+!!! note
+    `sub_group_reduce_add` must be encountered by all workitems of a sub-group
+    executing the kernel or by none at all.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    @device_override sub_group_reduce_add(val::T) where T
+    ```
+    As well as the on-device functionality.
+
+    This implementation **must** be synchronizing, on the same terms as
+    [`shfl_down`](@ref): a kernel may assume it needs no `sub_group_barrier`
+    before calling this function.
+"""
+function sub_group_reduce_add end
+
+"""
+    sub_group_reduce_add_types(::Backend)::Vector{DataType}
+
+Returns a vector of `DataType`s supported on `backend`
+
+!!! note
+    Backend implementations **must** implement this function
+    only if they support `sub_group_reduce_add` for any types.
+"""
+sub_group_reduce_add_types(::Backend) = DataType[]
+
+
+"""
     barrier()
 
 After a `barrier()` call, all read and writes to global and local memory
