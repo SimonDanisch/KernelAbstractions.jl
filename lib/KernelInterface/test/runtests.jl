@@ -458,6 +458,159 @@ dummy(a, b) = nothing
     end
 end
 
+# The mesh pipeline's emitter. All of this is portable arithmetic with no driver
+# in it, which is the point: the geometry-to-mesh lowering is only worth more
+# than a per-backend rewrite if it can be RUN and checked without a GPU.
+@testset "MeshEmitter" begin
+    cull = (position = 0.0f0,)
+    verts(n) = [(position = Float32(i),) for i in 1:n]
+
+    @testset "MeshConfig" begin
+        c = KI.MeshConfig(max_vertices = 4, max_primitives = 2,
+                          topology = KI.TriangleStrip(), threads = 32)
+        @test c.max_vertices == 4
+        @test c.max_primitives == 2
+        @test c.threads == 32
+        # The topology is a type parameter because a compiler dispatches on it.
+        @test c isa KI.MeshConfig{KI.TriangleStrip}
+        @test_throws ArgumentError KI.MeshConfig(max_vertices = 0, max_primitives = 1)
+        @test_throws ArgumentError KI.MeshConfig(max_vertices = 1, max_primitives = 0)
+        @test_throws ArgumentError KI.MeshConfig(max_vertices = 1, max_primitives = 1,
+                                                 threads = 0)
+    end
+
+    @testset "topologies" begin
+        function run(T, n; maxprim = 8)
+            out = KI.HostMeshOutput()
+            e = KI.MeshEmitter{T}(out, 1, 1, maxprim)
+            for v in verts(n)
+                KI.emit!(e, v)
+            end
+            return out, e
+        end
+
+        @test KI.primitives(first(run(KI.TriangleList, 6))) == [(1, 2, 3), (4, 5, 6)]
+        @test KI.primitives(first(run(KI.TriangleStrip, 4))) == [(1, 2, 3), (3, 2, 4)]
+        @test KI.primitives(first(run(KI.LineStrip, 4))) == [(1, 2), (2, 3), (3, 4)]
+        @test KI.primitives(first(run(KI.LineList, 4))) == [(1, 2), (3, 4)]
+        @test KI.primitives(first(run(KI.PointList, 3))) == [(1,), (2,), (3,)]
+
+        # A vertex is written for every emit!, whatever the topology does with it.
+        for (T, n) in ((KI.TriangleList, 6), (KI.TriangleStrip, 4),
+                       (KI.LineStrip, 4), (KI.LineList, 4), (KI.PointList, 3))
+            out, e = run(T, n)
+            @test sort!(collect(keys(out.vertices))) == Int32.(1:n)
+            @test KI.nvertices(e) == n
+        end
+    end
+
+    # The reason a strip alternates winding is ORIENTATION, so that is what gets
+    # measured. Reading the index tuples back would pass just as happily on the
+    # rule that makes every second triangle back-facing, which `CullBack` then
+    # drops: half a quad, and it reads as a shader bug.
+    @testset "strip winding" begin
+        quad = [(0.0f0, 0.0f0), (1.0f0, 0.0f0), (0.0f0, 1.0f0), (1.0f0, 1.0f0)]
+        area(a, b, c) = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1])
+
+        out = KI.HostMeshOutput()
+        e = KI.MeshEmitter{KI.TriangleStrip}(out, 1, 1, 2)
+        for c in 1:4
+            KI.emit!(e, (position = quad[c],))
+        end
+        signs = map(KI.primitives(out)) do (i, j, k)
+            area(out.vertices[i].position, out.vertices[j].position,
+                 out.vertices[k].position)
+        end
+        @test length(signs) == 2
+        @test all(>(0), signs) || all(<(0), signs)
+        # Without the alternation the second triangle would be (2,3,4), and this
+        # is the assertion that tells the two rules apart.
+        @test sign(area(quad[2], quad[3], quad[4])) != sign(signs[1])
+    end
+
+    @testset "endprimitive! restarts the run" begin
+        out = KI.HostMeshOutput()
+        e = KI.MeshEmitter{KI.TriangleStrip}(out, 1, 1, 8)
+        for c in 1:3
+            KI.emit!(e, (position = Float32(c),))
+        end
+        KI.endprimitive!(e)
+        for c in 4:6
+            KI.emit!(e, (position = Float32(c),))
+        end
+        # No triangle spans the seam: (2,3,4) and (3,4,5) would both be wrong.
+        @test KI.primitives(out) == [(1, 2, 3), (4, 5, 6)]
+    end
+
+    @testset "finish! fills the reserved slots" begin
+        # An invocation that emits nothing at all, which is what a culled
+        # zero-width line does. Its slots are still in the threadgroup's count.
+        out = KI.HostMeshOutput()
+        e = KI.MeshEmitter{KI.TriangleStrip}(out, 1, 1, 2)
+        KI.finish!(e, cull)
+        @test KI.nprimitives(e) == 2
+        @test KI.primitives(out) == [(1, 1, 1), (1, 1, 1)]
+        # The cull vertex is written, so the degenerate indices point at a
+        # position rather than at whatever the slot happened to hold.
+        @test out.vertices[Int32(1)] === cull
+
+        # Partially filled: three vertices close one triangle and leave one slot.
+        out = KI.HostMeshOutput()
+        e = KI.MeshEmitter{KI.TriangleStrip}(out, 1, 1, 2)
+        for c in 1:3
+            KI.emit!(e, (position = Float32(c),))
+        end
+        KI.finish!(e, cull)
+        @test KI.primitives(out) == [(1, 2, 3), (4, 4, 4)]
+        @test out.vertices[Int32(4)] === cull
+
+        # Filled to the budget: nothing to do, and no cull vertex written.
+        out = KI.HostMeshOutput()
+        e = KI.MeshEmitter{KI.TriangleStrip}(out, 1, 1, 2)
+        for c in 1:4
+            KI.emit!(e, (position = Float32(c),))
+        end
+        KI.finish!(e, cull)
+        @test length(out.vertices) == 4
+        @test KI.primitives(out) == [(1, 2, 3), (3, 2, 4)]
+    end
+
+    # A fixed range per invocation rather than a shared cursor is what keeps the
+    # geometry stage's order guarantee: input primitive order is invocation
+    # order is slot order, with no synchronisation to get there.
+    @testset "cooperating invocations" begin
+        out = KI.HostMeshOutput()
+        for t in 1:4
+            e = KI.MeshEmitter{KI.TriangleStrip}(out, (t - 1) * 4 + 1, (t - 1) * 2 + 1, 2)
+            for c in 1:4
+                KI.emit!(e, (position = (Float32(t), Float32(c)),))
+            end
+            KI.endprimitive!(e)
+            KI.finish!(e, (position = (0.0f0, 0.0f0),))
+        end
+        KI.set_mesh_outputs!(out, 16, 8)
+
+        @test sort!(collect(keys(out.vertices))) == Int32.(1:16)
+        @test KI.primitives(out) == [(1, 2, 3), (3, 2, 4), (5, 6, 7), (7, 6, 8),
+                                     (9, 10, 11), (11, 10, 12), (13, 14, 15), (15, 14, 16)]
+        @test out.declared[] == (Int32(16), Int32(8))
+    end
+
+    @testset "host answers" begin
+        # These say what went wrong rather than leaving a bare MethodError on a
+        # zero-argument function to be read as a missing method.
+        @test_throws ErrorException KI.mesh_thread_index()
+        @test_throws ErrorException KI.mesh_group_index()
+        @test_throws ErrorException KI.emit!(KI.NativeEmitter(), (position = 0.0f0,))
+        @test_throws ErrorException KI.endprimitive!(KI.NativeEmitter())
+        # The writers dispatch on the output object, so a type with no methods
+        # is a MethodError naming it, which is the accurate complaint.
+        @test_throws MethodError KI.set_mesh_vertex!(nothing, 1, (position = 0.0f0,))
+        @test_throws MethodError KI.set_mesh_triangle!(nothing, 1, 1, 2, 3)
+        @test_throws MethodError KI.set_mesh_outputs!(nothing, 1, 1)
+    end
+end
+
 @testset "Aqua" begin
     Aqua.test_all(KernelInterface)
 end

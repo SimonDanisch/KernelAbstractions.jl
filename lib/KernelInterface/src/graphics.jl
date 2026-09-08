@@ -20,11 +20,13 @@
 #     matched pairs of numbered slots, it works on both backends today, and
 #     `bench/showcase.jl` is written in it. Seven names removed rather than
 #     moved.
-#   * A geometry stage's `emit_vertex!`/`end_primitive!`. Metal has no geometry
-#     shaders at all — Apple's replacement is the mesh pipeline, which Mantle
-#     does not describe — so they are declared but a backend answers whether it
-#     has them through `caps`, and a pipeline naming one is refused when it
-#     does not.
+#   * A geometry stage's `emit_vertex!`/`end_primitive!` as the vocabulary a
+#     shader body writes. They are still declared below, but as the LEAF a
+#     native geometry lowering reaches, not as something an author calls: a body
+#     emits through `emit!(gs, vertex)`, and the emitter it was handed decides
+#     whether that becomes these or the mesh stage's indexed writes. See
+#     `mesh.jl`, which explains why an argument-free pair cannot be lowered two
+#     ways and why the mesh pipeline is the more general of the two.
 #
 # Indices are ONE-BASED on every backend. A shader that has to remember which
 # convention a builtin follows will eventually get it wrong.
@@ -150,6 +152,11 @@ function sample_texture_2d end
 # backend says so through `caps` and a pipeline naming one is refused there,
 # which is a question a caller can ask — unlike a `MethodError` from inside a
 # shader compile, which is what the arrangement before this file gave.
+#
+# These are what `emit!(::NativeEmitter, …)` lowers to, and not what a body
+# calls. A body that names them directly has picked one of the two lowerings by
+# hand and will not run where that stage does not exist; `mesh.jl` has the
+# emitter that makes the choice instead.
 
 """
     emit_vertex!()
