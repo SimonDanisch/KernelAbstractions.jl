@@ -91,9 +91,22 @@ struct MeshConfig{O<:Topology}
     threads::Int
 end
 
+# A mesh output object's vertex indices are EIGHT BITS: the intrinsic that
+# writes one is `air.set_index_mesh(ptr addrspace(7), i32, i8)`, read out of
+# `particle_gaussian_mesh` in VFX.framework's shipping metallib, whose own
+# declaration is `mesh<particle_vertex_io, particle_primitive_io, 96, 32,
+# triangle>`. So this is a hard ceiling and not a style choice, and a config
+# that exceeds it produces primitives pointing at wrapped-around vertices —
+# geometry that is wrong rather than absent, which is the worse failure.
+const MAX_MESH_VERTICES = 256
+
 function MeshConfig(; max_vertices::Integer, max_primitives::Integer,
                       topology::Topology = TriangleList(), threads::Integer = 1)
     max_vertices > 0 || throw(ArgumentError("MeshConfig: max_vertices must be positive"))
+    max_vertices <= MAX_MESH_VERTICES || throw(ArgumentError(
+        "MeshConfig: max_vertices is $max_vertices, and a mesh output object " *
+        "addresses its vertices with 8 bits, so at most $MAX_MESH_VERTICES fit. " *
+        "Split the work across more threadgroups instead of widening one."))
     max_primitives > 0 || throw(ArgumentError("MeshConfig: max_primitives must be positive"))
     threads > 0 || throw(ArgumentError("MeshConfig: threads must be positive"))
     MeshConfig(Int(max_vertices), Int(max_primitives), topology, Int(threads))
