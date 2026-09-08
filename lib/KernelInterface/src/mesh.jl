@@ -61,6 +61,68 @@
 #
 # Indices are ONE-BASED, like every index in this package.
 
+# ── Flat ─────────────────────────────────────────────────────────────────────
+
+"""
+    Flat{T}
+
+A stage output of type `T` that belongs to the PRIMITIVE rather than the vertex.
+
+Written in an interface list beside ordinary types, and nothing wraps the value:
+
+    outputs = (uv = Vec2f, halfwidth = Flat{Float32}, color = Flat{Vec4f})
+
+Both APIs have two ways to deliver such a value and they are not the same thing.
+A vertex stage has no primitive to attach one to, so there it is an
+interpolation qualifier: the value is written per vertex, not interpolated, and
+the provoking vertex is the one that counts. A mesh stage does have primitives
+and writes each one once, through `air.set_primitive_data_mesh` on Metal and a
+`perprimitiveEXT` output on Vulkan.
+
+Declaring the PLACE rather than the qualifier is what lets one declaration serve
+both. "This belongs to the primitive" implies "do not interpolate it"; the
+reverse does not, which is why `flat` alone would leave the mesh lowering
+guessing which vertex defined the primitive.
+"""
+struct Flat{T} end
+
+"""
+    isflat(T) -> Bool
+
+Whether an entry in an interface list is a [`Flat`](@ref) one.
+"""
+isflat(::Type{<:Flat}) = true
+isflat(::Type) = false
+
+"""
+    unflat(T) -> Type
+
+The value type of an interface entry, with any [`Flat`](@ref) removed. The type
+a stage actually produces, which is the same either way.
+"""
+unflat(::Type{Flat{T}}) where {T} = T
+unflat(::Type{T}) where {T} = T
+
+"""
+    flatnames(interface::NamedTuple) -> Tuple{Vararg{Symbol}}
+    smoothnames(interface::NamedTuple) -> Tuple{Vararg{Symbol}}
+
+The names on each side of the split, in declaration order.
+
+A geometry or mesh body emits the smooth ones per vertex and the flat ones per
+primitive, so this partition is what says which call each field belongs in.
+"""
+flatnames(nt::NamedTuple) = filter(n -> isflat(nt[n]), keys(nt))
+@doc (@doc flatnames) smoothnames(nt::NamedTuple) = filter(n -> !isflat(nt[n]), keys(nt))
+
+"""
+    valuetypes(interface::NamedTuple) -> NamedTuple
+
+The same list with every [`Flat`](@ref) removed, which is what a backend builds
+its output struct from: flatness decides WHERE a value goes, never what it is.
+"""
+valuetypes(nt::NamedTuple) = NamedTuple{keys(nt)}(map(unflat, values(nt)))
+
 # ── Configuration a compiler reads ───────────────────────────────────────────
 
 """
@@ -180,6 +242,25 @@ emits triangles never emits anything else.
 function set_mesh_triangle! end
 @doc (@doc set_mesh_triangle!) function set_mesh_line! end
 @doc (@doc set_mesh_triangle!) function set_mesh_point! end
+
+"""
+    set_mesh_primitive_data!(out, slot::Integer, data::NamedTuple)
+
+Write the PER-PRIMITIVE values of the primitive at `slot`, counting from one.
+
+Separate from [`set_mesh_vertex!`](@ref) because the two are separate planes in
+both APIs: `air.set_primitive_data_mesh` on Metal, a `perprimitiveEXT` output on
+Vulkan. `data` is the `Flat`-declared subset of the stage's outputs — see
+[`Flat`](@ref) for why the declaration names the plane and not the interpolation
+qualifier.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    @device_override set_mesh_primitive_data!(out, ::Integer, ::NamedTuple)
+    ```
+"""
+function set_mesh_primitive_data! end
 
 """
     set_mesh_outputs!(out, nvertices::Integer, nprimitives::Integer)
@@ -326,7 +407,7 @@ Unlike a geometry stage, a mesh threadgroup declares its output count once for
 all invocations, so an invocation that emits fewer primitives than it reserved
 leaves slots behind. [`finish!`](@ref) fills them.
 """
-mutable struct MeshEmitter{O<:Topology, T} <: PrimitiveEmitter
+mutable struct MeshEmitter{O<:Topology, FN, T} <: PrimitiveEmitter
     const out::T
     const vbase::Int32
     const pbase::Int32
@@ -336,11 +417,15 @@ mutable struct MeshEmitter{O<:Topology, T} <: PrimitiveEmitter
     run::Int32    # vertices since the last endprimitive!
 end
 
-function MeshEmitter{O}(out::T, vbase::Integer, pbase::Integer,
-                        maxprimitives::Integer) where {O<:Topology, T}
-    MeshEmitter{O,T}(out, Int32(vbase), Int32(pbase), Int32(maxprimitives),
-                     Int32(0), Int32(0), Int32(0))
+function MeshEmitter{O,FN}(out::T, vbase::Integer, pbase::Integer,
+                           maxprimitives::Integer) where {O<:Topology, FN, T}
+    MeshEmitter{O,FN,T}(out, Int32(vbase), Int32(pbase), Int32(maxprimitives),
+                        Int32(0), Int32(0), Int32(0))
 end
+
+"""No flat outputs, which is the common case and what every smooth-only stage is."""
+MeshEmitter{O}(out, vbase::Integer, pbase::Integer, maxprimitives::Integer) where {O<:Topology} =
+    MeshEmitter{O,()}(out, vbase, pbase, maxprimitives)
 
 """Vertices this emitter has written."""
 nvertices(e::MeshEmitter) = e.nv
@@ -357,9 +442,30 @@ nprimitives(e::MeshEmitter) = e.np
     return e
 end
 
+# Where a vertex's fields go. `FN` is the `Flat`-declared subset of the stage's
+# outputs, so the split is a compile-time `structdiff` and the two planes of the
+# mesh output object are reached by name rather than by position.
+#
+# `position` is never in `FN` — it is not a declared output at all — so it stays
+# on the vertex side, which is where it belongs.
+@inline function _writevertex!(e::MeshEmitter{O,FN}, slot, v::NamedTuple) where {O,FN}
+    set_mesh_vertex!(e.out, slot, Base.structdiff(v, NamedTuple{FN}))
+    return nothing
+end
+
+# A primitive just closed at `slot`, so its per-primitive values are written ONCE
+# — which is the whole point of declaring them as the primitive's. `v` is the
+# vertex that closed it; for a `Flat` field every vertex of the primitive carries
+# the same value, exactly as a provoking-vertex convention would give.
+@inline function _closed!(e::MeshEmitter{O,FN}, slot, v::NamedTuple) where {O,FN}
+    isempty(FN) || set_mesh_primitive_data!(e.out, slot, NamedTuple{FN}(v))
+    e.np += Int32(1)
+    return nothing
+end
+
 @inline function emit!(e::MeshEmitter{TriangleStrip}, v::NamedTuple)
     i = _vslot(e)
-    set_mesh_vertex!(e.out, i, v)
+    _writevertex!(e, i, v)
     if e.run >= Int32(2)
         a = i - Int32(2)
         b = i - Int32(1)
@@ -372,46 +478,46 @@ end
         else
             set_mesh_triangle!(e.out, _pslot(e), b, a, i)
         end
-        e.np += Int32(1)
+        _closed!(e, _pslot(e), v)
     end
     return _wrote!(e)
 end
 
 @inline function emit!(e::MeshEmitter{TriangleList}, v::NamedTuple)
     i = _vslot(e)
-    set_mesh_vertex!(e.out, i, v)
+    _writevertex!(e, i, v)
     if e.run % Int32(3) == Int32(2)
         set_mesh_triangle!(e.out, _pslot(e), i - Int32(2), i - Int32(1), i)
-        e.np += Int32(1)
+        _closed!(e, _pslot(e), v)
     end
     return _wrote!(e)
 end
 
 @inline function emit!(e::MeshEmitter{LineStrip}, v::NamedTuple)
     i = _vslot(e)
-    set_mesh_vertex!(e.out, i, v)
+    _writevertex!(e, i, v)
     if e.run >= Int32(1)
         set_mesh_line!(e.out, _pslot(e), i - Int32(1), i)
-        e.np += Int32(1)
+        _closed!(e, _pslot(e), v)
     end
     return _wrote!(e)
 end
 
 @inline function emit!(e::MeshEmitter{LineList}, v::NamedTuple)
     i = _vslot(e)
-    set_mesh_vertex!(e.out, i, v)
+    _writevertex!(e, i, v)
     if isodd(e.run)
         set_mesh_line!(e.out, _pslot(e), i - Int32(1), i)
-        e.np += Int32(1)
+        _closed!(e, _pslot(e), v)
     end
     return _wrote!(e)
 end
 
 @inline function emit!(e::MeshEmitter{PointList}, v::NamedTuple)
     i = _vslot(e)
-    set_mesh_vertex!(e.out, i, v)
+    _writevertex!(e, i, v)
     set_mesh_point!(e.out, _pslot(e), i)
-    e.np += Int32(1)
+    _closed!(e, _pslot(e), v)
     return _wrote!(e)
 end
 
@@ -482,11 +588,12 @@ than filled in order.
 struct HostMeshOutput
     vertices::Dict{Int32,Any}
     primitives::Dict{Int32,Tuple}
+    primitivedata::Dict{Int32,Any}
     declared::Base.RefValue{Tuple{Int32,Int32}}
 end
 
 HostMeshOutput() = HostMeshOutput(Dict{Int32,Any}(), Dict{Int32,Tuple}(),
-                                  Ref((Int32(0), Int32(0))))
+                                  Dict{Int32,Any}(), Ref((Int32(0), Int32(0))))
 
 function set_mesh_vertex!(o::HostMeshOutput, slot::Integer, v::NamedTuple)
     o.vertices[Int32(slot)] = v
@@ -509,6 +616,11 @@ function set_mesh_point!(o::HostMeshOutput, slot::Integer, i0::Integer)
     return nothing
 end
 
+function set_mesh_primitive_data!(o::HostMeshOutput, slot::Integer, data::NamedTuple)
+    o.primitivedata[Int32(slot)] = data
+    return nothing
+end
+
 function set_mesh_outputs!(o::HostMeshOutput, nv::Integer, np::Integer)
     o.declared[] = (Int32(nv), Int32(np))
     return nothing
@@ -525,3 +637,7 @@ primitives(o::HostMeshOutput) = [o.primitives[k] for k in sort!(collect(keys(o.p
 
 """The vertices in slot order, as the NamedTuples that were written."""
 vertices(o::HostMeshOutput) = [o.vertices[k] for k in sort!(collect(keys(o.vertices)))]
+
+"""The per-primitive data in slot order, one entry per primitive that got any."""
+primitivedata(o::HostMeshOutput) =
+    [o.primitivedata[k] for k in sort!(collect(keys(o.primitivedata)))]

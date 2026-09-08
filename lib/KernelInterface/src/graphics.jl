@@ -146,6 +146,55 @@ names a slot, not a handle.
 """
 function sample_texture_2d end
 
+# ── Geometry stage configuration ─────────────────────────────────────────────
+
+"""
+    GeometryConfig(; input = TriangleList(), output = TriangleStrip(),
+                     max_vertices = 3, invocations = 1)
+
+What a geometry stage consumes and may produce.
+
+`input` fixes how many vertices one invocation sees — three for a
+`TriangleList`, four for either adjacency form — and `output` is what the
+emitted vertices are grouped into. `max_vertices` bounds one invocation's
+output, and `invocations` is how many times the stage runs per input primitive.
+
+Here, and not in a runtime, for the reason [`MeshConfig`](@ref) is: a compiler
+reads every field to emit the stage's execution modes. It was Lava's, which
+meant a portable pipeline description could not hold one without depending on a
+SPIR-V compiler.
+"""
+struct GeometryConfig{I<:Topology, O<:Topology}
+    input_topology::I
+    output_topology::O
+    max_vertices::Int
+    invocations::Int
+end
+
+function GeometryConfig(; input::Topology = TriangleList(),
+                          output::Topology = TriangleStrip(),
+                          max_vertices::Integer = 3, invocations::Integer = 1)
+    max_vertices > 0 || throw(ArgumentError("GeometryConfig: max_vertices must be positive"))
+    invocations > 0 || throw(ArgumentError("GeometryConfig: invocations must be positive"))
+    GeometryConfig(input, output, Int(max_vertices), Int(invocations))
+end
+
+"""
+    inputvertices(topology) -> Int
+
+How many vertices one primitive of `topology` hands a geometry stage.
+
+Both adjacency forms give four: the segment plus a neighbour on each side. They
+differ in how the index buffer is walked, not in what one invocation sees.
+"""
+inputvertices(::PointList)          = 1
+inputvertices(::LineList)           = 2
+inputvertices(::LineStrip)          = 2
+inputvertices(::LineListAdjacency)  = 4
+inputvertices(::LineStripAdjacency) = 4
+inputvertices(::TriangleList)       = 3
+inputvertices(::TriangleStrip)      = 3
+
 # ── Geometry stage ───────────────────────────────────────────────────────────
 #
 # Declared, and not every backend has them: Metal has no geometry stage. A
