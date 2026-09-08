@@ -26,5 +26,11 @@ include("coopmat.jl")
 # Graphics vocabulary a compiler and a backend both dispatch on, for the same
 # reason the matrix vocabulary is here.
 include("topology.jl")
+# The device-side names a shader body calls. Here rather than in a runtime,
+# because a compiler lowers them and a runtime only launches what was compiled
+# — and because a backend cannot override a name declared in a package that
+# depends on IT. See the headers of both files.
+include("graphics.jl")
+include("raytracing.jl")
 
 end
