@@ -51,6 +51,52 @@ Which vertex this invocation is for, counting from one.
 function vertex_index end
 
 """
+    VertexIndex(value::Int32)
+
+Which vertex a vertex body is being evaluated for, handed to it EXPLICITLY.
+
+Declared as a leading parameter:
+
+    function myvertex(vid::VertexIndex, positions, colours)
+        i = vid.value
+        …
+    end
+
+`vertex_index()` above is the same number and is what a body uses when it runs as
+a real vertex stage: the rasteriser supplies it and there is nothing to pass. This
+marker exists because a mesh stage HAS no such builtin, and a geometry stage
+lowered onto one (see Mantle's `lower_geometry_to_mesh`) has to evaluate the
+vertex body once per input vertex of its primitive — several times, in one
+invocation, at indices it computes. A zero-argument builtin cannot answer
+differently on each of those calls; a parameter can.
+
+For an INDEXED draw the value is what the index buffer holds, matching
+`vertex_index()`'s meaning on a real vertex stage rather than the position in the
+draw. So the same body reads the same vertex either way.
+
+Opt in per shader. A body that does not declare it keeps using `vertex_index()`
+and nothing about it changes; a backend passes this only to bodies that ask, so
+the two spellings coexist and neither is privileged.
+"""
+struct VertexIndex
+    value::Int32
+end
+
+VertexIndex(i::Integer) = VertexIndex(Int32(i))
+
+"""
+    wantsvertexindex(f, argtypes::Tuple) -> Bool
+
+Whether `f` declares a leading [`VertexIndex`](@ref) for these argument types.
+
+Asked of the METHOD TABLE rather than recorded on the `VertexShader`, so a shader
+declares the parameter in the one place a reader looks — its own signature — and
+cannot have the declaration and the flag disagree.
+"""
+wantsvertexindex(@nospecialize(f), @nospecialize(argtypes::Tuple)) =
+    hasmethod(f, Tuple{VertexIndex, argtypes...})
+
+"""
     instance_index()::Int32
 
 Which instance this invocation is for, counting from one.
