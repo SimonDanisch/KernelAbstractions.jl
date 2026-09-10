@@ -45,3 +45,36 @@ struct PatchList <: Topology end
 # as scattered dashes.
 struct LineListAdjacency <: Topology end
 struct LineStripAdjacency <: Topology end
+
+"""
+    primitivevertices(t::Topology) -> Int
+
+How many vertices one primitive of `t` has.
+
+The number a geometry stage is handed per invocation, and the number a mesh
+lowering writes per primitive. It is a property of the TOPOLOGY and nothing
+else, which is why it is here: it was written out twice — once in Lava's SPIR-V
+emitter to pick the geometry stage's input execution mode, once in Mantle's
+Vulkan backend to size the arrayed inputs its geometry wrapper reads — and two
+tables of one fact drift the moment a topology is added to one of them.
+
+A strip's answer is the size of its sliding WINDOW, not the length of the strip:
+a `TriangleStrip` delivers three vertices per primitive like a `TriangleList`,
+and the two differ in how the index stream is walked, not in what a primitive
+is.
+"""
+function primitivevertices end
+
+primitivevertices(::PointList)          = 1
+primitivevertices(::LineList)           = 2
+primitivevertices(::LineStrip)          = 2
+primitivevertices(::TriangleList)       = 3
+primitivevertices(::TriangleStrip)      = 3
+primitivevertices(::LineListAdjacency)  = 4
+primitivevertices(::LineStripAdjacency) = 4
+
+# No answer, rather than a wrong one: a patch's vertex count is the tessellation
+# configuration's (`TessConfig.patch_size`), not the topology's, and a caller
+# that reaches here has asked the wrong thing.
+primitivevertices(::PatchList) = throw(ArgumentError(
+    "a patch's vertex count is the tessellation configuration's, not the topology's"))

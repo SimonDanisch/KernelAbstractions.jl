@@ -359,12 +359,18 @@ function emit! end
 @doc (@doc emit!) function endprimitive! end
 
 """
-    NativeEmitter()
+    NativeEmitter{Out, FN}()
 
 Emits through a backend's own geometry stage.
 
-Zero-sized: it names a lowering and carries nothing, because a geometry stage's
-outputs ARE implicit — the one place the argument-free shape is the right one.
+Zero-sized, like the stage it emits into: a geometry stage's output VARIABLES
+are implicit, so there is nothing to carry at run time. `Out` is the declared
+output type (`position` plus the varyings, `Flat` stripped) and `FN` the names
+among them that belong to the primitive rather than the vertex — the same pair
+`MeshEmitter{O,FN}` carries, and type parameters for the same reason: a
+varying's location is its position in the declaration and its flatness picks
+the write, so both decide instructions and neither can be a field.
+
 The backend's compiler turns `emit!` into "write the output variables, then
 emit", which is one instruction pair and not something assembled from smaller
 pieces, so this is where `emit_vertex!` and `end_primitive!` are used and a
@@ -380,7 +386,10 @@ emitter from what the backend reports.
     @device_override endprimitive!(::NativeEmitter)
     ```
 """
-struct NativeEmitter <: PrimitiveEmitter end
+struct NativeEmitter{Out, FN} <: PrimitiveEmitter end
+
+"""No flat outputs, which is the common case and what every smooth-only stage is."""
+NativeEmitter{Out}() where {Out} = NativeEmitter{Out, ()}()
 
 # The host answers. A bare MethodError here reads as "you passed the wrong
 # emitter", which is the one thing that did not happen.
