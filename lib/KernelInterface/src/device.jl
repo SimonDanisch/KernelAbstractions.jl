@@ -158,22 +158,35 @@ function get_sub_group_local_id end
 
 
 """
-    localmemory(::Type{T}, dims)
+    localmemory(::Type{T}, dims, [id])
 
 Declare memory that is local to a workgroup.
+
+`id` identifies the buffer and **must differ between buffers in one kernel**.
+A backend lowers workgroup memory to a module-level global keyed by the types it
+is given, so two allocations that a backend cannot tell apart are ONE buffer:
+the second write lands on the first tile, the kernel runs, and the answer is
+wrong. `(T, Dims)` alone cannot tell them apart — a tiled matmul stages two
+tiles of the same element type and the same shape, which is the common case
+rather than a corner one.
+
+`KernelAbstractions.@localmem` mints the id per call site, because a macro can.
+A plain function cannot, so the caller supplies it. The two-argument form uses
+`1`, which is correct for a kernel with one buffer and is why it stays.
 
 !!! note
     Backend implementations **must** implement:
     ```
-    @device_override localmemory(::Type{T}, ::Val{Dims}) where {T, Dims}
+    @device_override localmemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
     ```
-    As well as the on-device functionality.
+    As well as the on-device functionality. `Id` has to reach whatever names the
+    global, or the parameter is decoration.
 """
-localmemory(::Type{T}, dims) where {T} = localmemory(T, Val(dims))
+localmemory(::Type{T}, dims, id = 1) where {T} = localmemory(T, Val(dims), Val(id))
 
 # The `Val` form only exists in a backend's overlay method table, so off-device it
 # would otherwise fall back to the forwarding method above and recurse forever.
-localmemory(::Type{T}, ::Val) where {T} =
+localmemory(::Type{T}, ::Val, ::Val) where {T} =
     error("Local memory used outside kernel or not captured")
 
 

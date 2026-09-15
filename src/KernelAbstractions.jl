@@ -598,7 +598,13 @@ include("macros.jl")
 ###
 
 function Scratchpad end
-SharedMemory(::Type{T}, dims::Val{Dims}, id::Val{Id}) where {T, Dims, Id} = KI.localmemory(T, dims)
+# The `id` is forwarded, not dropped. `@localmem` mints one per call site
+# precisely so that two buffers of the same type and shape are two buffers; a
+# shim that discards it made them one on every backend that answers
+# `KI.localmemory` rather than `KA.SharedMemory` — silently, since the second
+# write simply lands on the first tile.
+SharedMemory(::Type{T}, dims::Val{Dims}, id::Val{Id}) where {T, Dims, Id} =
+    KI.localmemory(T, dims, Id)
 
 __synchronize() = KI.barrier()
 

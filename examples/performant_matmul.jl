@@ -20,8 +20,11 @@ function coalesced_matmul_kernel!(
     i, j, _ = KI.get_local_id()
 
     # +1 to avoid bank conflicts on shared memory
-    tile1 = KI.localmemory(eltype(output), (TDIM + BANK, TDIM))
-    tile2 = KI.localmemory(eltype(output), (TDIM + BANK, TDIM))
+    # Distinct ids: same element type, same shape, two buffers. Without them a
+    # backend cannot tell the allocations apart and both names resolve to one
+    # tile.
+    tile1 = KI.localmemory(eltype(output), (TDIM + BANK, TDIM), 1)
+    tile2 = KI.localmemory(eltype(output), (TDIM + BANK, TDIM), 2)
 
     # variable for tile output
     outval = -zero(eltype(output))

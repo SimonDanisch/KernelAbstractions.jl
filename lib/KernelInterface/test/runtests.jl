@@ -82,6 +82,16 @@ end
     # back into the forwarding method.
     @test_throws "used outside kernel" KI.localmemory(Float32, (2, 2))
     @test_throws "used outside kernel" KI.localmemory(Float32, Val((2, 2)))
+
+    # The id is what makes two buffers of one type and shape two buffers: a
+    # backend lowers workgroup memory to a global keyed by what it is given, so
+    # without it the second allocation IS the first and the second write lands
+    # on the first tile. Silent, and wrong. Every form has to reach the `Val`
+    # method a backend overrides, which is what these pin.
+    @test_throws "used outside kernel" KI.localmemory(Float32, (2, 2), 7)
+    @test only(methods(KI.localmemory, Tuple{Type{Float32}, Val, Val})).nargs == 4
+    # Two arguments is the one-buffer case and defaults the id, so it stays.
+    @test hasmethod(KI.localmemory, Tuple{Type{Float32}, Tuple{Int, Int}})
 end
 
 @testset "get_backend" begin
