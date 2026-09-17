@@ -7,8 +7,8 @@
 # These were declared in Mantle and defined AGAIN in Lava, with a bridge in
 # `MantleVulkanExt` — `Mantle.$f() = Lava.$f()` — that existed only because Lava
 # cannot override a Mantle name: Mantle depends on Lava, not the other way
-# round. Both depend on KernelInterface. So each backend overrides here, the
-# bridge is gone, and a downstream package imports one name from one place.
+# round. Both depend on KernelInterface. So each backend overrides here, no
+# bridge is needed, and a downstream package imports one name from one place.
 #
 # What is NOT here, and deliberately:
 #
@@ -206,9 +206,8 @@ emitted vertices are grouped into. `max_vertices` bounds one invocation's
 output, and `invocations` is how many times the stage runs per input primitive.
 
 Here, and not in a runtime, for the reason [`MeshConfig`](@ref) is: a compiler
-reads every field to emit the stage's execution modes. It was Lava's, which
-meant a portable pipeline description could not hold one without depending on a
-SPIR-V compiler.
+reads every field to emit the stage's execution modes, and a portable pipeline
+description has to hold one without depending on a SPIR-V compiler.
 """
 struct GeometryConfig{I<:Topology, O<:Topology}
     input_topology::I
@@ -245,8 +244,8 @@ inputvertices(::TriangleStrip)      = 3
 #
 # Declared, and not every backend has them: Metal has no geometry stage. A
 # backend says so through `caps` and a pipeline naming one is refused there,
-# which is a question a caller can ask — unlike a `MethodError` from inside a
-# shader compile, which is what the arrangement before this file gave.
+# which is a question a caller can ask, unlike a `MethodError` from inside a
+# shader compile.
 #
 # These are what `emit!(::NativeEmitter, …)` lowers to, and not what a body
 # calls. A body that names them directly has picked one of the two lowerings by

@@ -1,10 +1,9 @@
 ###
 # What a kernel has to know about the device it will run on.
 #
-# This was written twice, field for field, and bridged by a positional copy: once
-# in a Vulkan backend and once in the graph layer above it, because neither could
-# depend on the other. Both docstrings independently argued the type belonged
-# somewhere both could name. This is that place.
+# Here because a backend and the graph layer above it both name it, and neither
+# depends on the other: written twice, field for field, the two can only be
+# bridged by a positional copy that misaligns silently.
 ###
 
 """

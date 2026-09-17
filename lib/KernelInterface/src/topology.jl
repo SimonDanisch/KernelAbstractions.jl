@@ -11,9 +11,9 @@ Two sides need this vocabulary and neither can own it:
     `VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST`, `MTLPrimitiveTypeTriangle`.
 
 It lived in Lava, which is a Julia→SPIR-V compiler, and a Metal backend needs
-`TriangleList` without importing one. Defining it twice was the alternative, and
-that is exactly what `DeviceCaps` did before it moved here — two declarations
-bridged by a positional copy, which drifted.
+`TriangleList` without importing one. The alternative is defining it twice, and
+two declarations of one type can only be bridged by a positional copy, which
+drifts.
 
 Nothing here is any one API's. The names are the ones every graphics API uses.
 """

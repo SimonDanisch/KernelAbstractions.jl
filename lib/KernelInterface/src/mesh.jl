@@ -26,9 +26,9 @@
 #
 # ── Why the emitter is a VALUE and not a set of global intrinsics ─────────────
 #
-# The geometry stage's vocabulary used to be `emit_vertex!()` and
-# `end_primitive!()` — argument-free globals writing to implicit output
-# variables. That shape cannot be lowered two ways, because there is nothing to
+# A geometry-stage vocabulary of `emit_vertex!()` and `end_primitive!()` —
+# argument-free globals writing to implicit output variables — cannot be lowered
+# two ways, because there is nothing to
 # dispatch on: a body calling `emit_vertex!()` names one lowering and no other.
 #
 # So the body takes an emitter:
@@ -50,9 +50,9 @@
 #
 # ── Why the output object is an explicit argument ────────────────────────────
 #
-# It was not, in the first draft: `set_mesh_vertex!(slot, vertex)`, matching the
-# argument-free shape of the other builtins. That cannot be lowered to Metal at
-# all. In MSL the mesh object is a PARAMETER of the entry function — the stage
+# `set_mesh_vertex!(slot, vertex)`, matching the argument-free shape of the
+# other builtins, cannot be lowered to Metal at all: in MSL the mesh object is a
+# PARAMETER of the entry function — the stage
 # is handed somewhere to write, and an intrinsic taking only a slot has no way
 # to name it. SPIR-V is the odd one here, not Metal: its output arrays are
 # implicit, so it can ignore an argument the other needs, while the reverse is

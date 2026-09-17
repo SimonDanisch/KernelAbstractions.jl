@@ -1,11 +1,10 @@
 """
 Cooperative matrices: the type a kernel names to reach matrix hardware.
 
-Here for the reason `MatrixUse` and `MatrixScope` next door are, and the comment
-that used to sit on this file in Lava already made the argument for those:
-"every backend has to name the same concepts … so the vocabulary belongs in the
-module they all implement". The TYPE is the same case. Vulkan reaches this
-through `OpCooperativeMatrixMulAddKHR`, Metal through `simdgroup_matrix`, CUDA
+Here for the reason `MatrixUse` and `MatrixScope` next door are: every backend
+has to name the same concepts, so the vocabulary belongs in the module they all
+implement, and the TYPE is the same case. Vulkan reaches this through
+`OpCooperativeMatrixMulAddKHR`, Metal through `simdgroup_matrix`, CUDA
 through `wmma`; the tile a kernel is written against is the same object, and a
 Metal backend must not import a SPIR-V compiler to name it.
 
