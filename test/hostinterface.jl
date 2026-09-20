@@ -58,6 +58,7 @@ function hostinterface_testsuite(_backend, AT)
         @test KI.multiprocessor_count(backend) isa Int
         @test KI.sub_group_size(backend) isa Int
         @test KI.shfl_down_types(backend) isa Vector{DataType}
+        @test KI.shfl_types(backend) isa Vector{DataType}
 
         function ki_hostinterface_kernel(x)
             i = KI.get_global_id().x

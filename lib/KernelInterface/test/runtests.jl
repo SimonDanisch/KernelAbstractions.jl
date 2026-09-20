@@ -35,7 +35,7 @@ end
         KI.get_sub_group_size, KI.get_max_sub_group_size,
         KI.get_num_sub_groups, KI.get_sub_group_id,
         KI.get_sub_group_local_id,
-        KI.shfl_down, KI.sub_group_reduce_add,
+        KI.shfl, KI.shfl_down, KI.sub_group_reduce_add,
         KI.kernel_max_work_group_size, KI.max_work_group_size, KI.sub_group_size,
         KI.argconvert, KI.kernel_function,
         # Host-side stubs: required backend methods with no sensible fallback.
@@ -74,6 +74,7 @@ end
 
     # Permissive defaults: a backend only implements these if it can do better.
     @test KI.shfl_down_types(StubBackend()) == DataType[]
+    @test KI.shfl_types(StubBackend()) == DataType[]
     @test KI.sub_group_reduce_add_types(StubBackend()) == DataType[]
     @test KI.multiprocessor_count(StubBackend()) == 0
 

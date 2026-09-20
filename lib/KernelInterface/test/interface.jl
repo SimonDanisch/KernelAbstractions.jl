@@ -65,6 +65,12 @@ function shfl_down_test_kernel(a, b, ::Val{N}) where {N}
     return
 end
 
+function shfl_test_kernel(a, b, ::Val{N}) where {N}
+    idx = KI.get_sub_group_local_id()
+    b[idx] = KI.shfl(a[idx], N - 1)
+    return
+end
+
 function sub_group_reduce_add_test_kernel(a, b)
     idx = KI.get_sub_group_local_id()
 
@@ -226,6 +232,18 @@ function interface_testsuite(backend, AT)
 
                 b = Array(dev_b)
                 @test sum(a) ≈ b[1]
+            end
+        end
+        @testset "shfl" begin
+            @test !isempty(KI.shfl_types(backend()))
+            types_to_test = setdiff(KI.shfl_types(backend()), [Bool])
+            @testset "$T" for T in types_to_test
+                N = KI.sub_group_size(backend())
+                a = T.(1:N)
+                dev_a = AT(a)
+                dev_b = AT(zeros(T, N))
+                KI.@kernel backend() workgroupsize = N shfl_test_kernel(dev_a, dev_b, Val(N))
+                @test Array(dev_b) == fill(a[end], N)
             end
         end
     end

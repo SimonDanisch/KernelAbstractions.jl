@@ -213,6 +213,14 @@ Read `val` from a lane with higher id given by `offset`.
 function shfl_down end
 
 """
+    shfl(val::T, lane::Integer) where T
+
+Read `val` from the absolute zero-based `lane` of the current subgroup. Like
+[`shfl_down`](@ref), every active lane must encounter the call.
+"""
+function shfl end
+
+"""
     shfl_down_types(::Backend)::Vector{DataType}
 
 Returns a vector of `DataType`s supported on `backend`
@@ -222,6 +230,7 @@ Returns a vector of `DataType`s supported on `backend`
     only if they support `shfl_down` for any types.
 """
 shfl_down_types(::Backend) = DataType[]
+shfl_types(::Backend) = DataType[]
 
 
 """

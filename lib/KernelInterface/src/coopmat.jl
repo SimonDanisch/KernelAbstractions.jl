@@ -8,9 +8,12 @@ implement, and the TYPE is the same case. Vulkan reaches this through
 through `wmma`; the tile a kernel is written against is the same object, and a
 Metal backend must not import a SPIR-V compiler to name it.
 
-The type is opaque — one `Int32` SSA anchor, no element storage — so nothing in
-it is any one API's. What IS a backend's is the nine `coopmat_*` operations
-below, declared here and lowered by whichever compiler is in play.
+The type is opaque.  Its last, deliberately hidden parameter is the backend's
+native representation: Lava uses one `Int32` SSA anchor, while a native GPU
+compiler can keep the register tuple its matrix intrinsic returns.  Kernels
+name only the first five parameters, so that representation never leaks into
+portable code.  What IS a backend's is the `coopmat_*` operations below,
+declared here and lowered by whichever compiler is in play.
 """
 
 """
@@ -31,10 +34,17 @@ written out rather than reached by default.
 Every operation requires its operands to agree on scope. Mixing them is then a
 method error at the call site instead of a module the driver rejects.
 """
-struct CoopMatrix{T,M,N,Use<:MatrixUse,Scope<:MatrixScope}
-    # SSA anchor, not element storage — see the note above.
-    handle::Int32
+struct CoopMatrix{T,M,N,Use<:MatrixUse,Scope<:MatrixScope,Storage}
+    # Opaque backend value.  `handle` keeps the source-level API used by the
+    # SPIR-V lowering; on native backends it may be a register fragment.
+    handle::Storage
 end
+
+# Hide `Storage` from kernel code.  A partial parametric type does not receive a
+# default outer constructor automatically, so spell out the one public
+# construction point used by every backend lowering.
+@inline CoopMatrix{T,M,N,U,S}(x::R) where {T,M,N,U,S,R} =
+    CoopMatrix{T,M,N,U,S,R}(x)
 
 """
     AcceleratedMatrix{T,M,N,Use}
@@ -185,7 +195,7 @@ tensor cores.
 # no meaning, exactly like the subgroup intrinsics.
 #
 # The `Base` methods above are written against these, which is what makes the
-# type portable: a backend implements nine functions and inherits `zero`, `*`,
+# type portable: a backend implements eleven functions and inherits `zero`, `*`,
 # `muladd`, `convert` and `copyto!` unchanged.
 
 """
@@ -202,6 +212,12 @@ function coopmat_store end
 
 """    coopmat_muladd(a, b, c) -> `a*b + c`, accumulated in `c`'s element type."""
 function coopmat_muladd end
+
+"""    coopmat_mul(a, b) -> component-wise product of two tiles."""
+function coopmat_mul end
+
+"""    coopmat_add(a, b) -> component-wise sum of two tiles."""
+function coopmat_add end
 
 """    coopmat_zero(::Type{CoopMatrix{…}}) -> an all-zero tile."""
 function coopmat_zero end
