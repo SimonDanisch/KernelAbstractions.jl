@@ -299,6 +299,25 @@ const CL_DEVICE_NON_UNIFORM_WORK_GROUP_SUPPORT = 0x1065
 
 const CL_DEVICE_OPENCL_C_ALL_VERSIONS = 0x1066
 
+# cl_ext_float_atomics
+const CL_DEVICE_SINGLE_FP_ATOMIC_CAPABILITIES_EXT = 0x4231
+
+const CL_DEVICE_DOUBLE_FP_ATOMIC_CAPABILITIES_EXT = 0x4232
+
+const CL_DEVICE_HALF_FP_ATOMIC_CAPABILITIES_EXT = 0x4233
+
+const CL_DEVICE_GLOBAL_FP_ATOMIC_LOAD_STORE_EXT = UInt64(1) << 0
+
+const CL_DEVICE_GLOBAL_FP_ATOMIC_ADD_EXT = UInt64(1) << 1
+
+const CL_DEVICE_GLOBAL_FP_ATOMIC_MIN_MAX_EXT = UInt64(1) << 2
+
+const CL_DEVICE_LOCAL_FP_ATOMIC_LOAD_STORE_EXT = UInt64(1) << 16
+
+const CL_DEVICE_LOCAL_FP_ATOMIC_ADD_EXT = UInt64(1) << 17
+
+const CL_DEVICE_LOCAL_FP_ATOMIC_MIN_MAX_EXT = UInt64(1) << 18
+
 const CL_DEVICE_PREFERRED_WORK_GROUP_SIZE_MULTIPLE = 0x1067
 
 const CL_DEVICE_WORK_GROUP_COLLECTIVE_FUNCTIONS_SUPPORT = 0x1068
@@ -646,6 +665,23 @@ end
     )::cl_int
 end
 
+# sizes passed as tuples, which `ccall` copies to the stack
+@checked function clEnqueueNDRangeKernel(
+        command_queue, kernel, work_dim,
+        global_work_size::NTuple{3, Csize_t}, local_work_size::NTuple{3, Csize_t}, event::Ref{cl_event}
+    )
+    @ccall libopencl.POclEnqueueNDRangeKernel(
+        command_queue::cl_command_queue,
+        kernel::cl_kernel, work_dim::cl_uint,
+        C_NULL::Ptr{Csize_t},
+        global_work_size::Ref{NTuple{3, Csize_t}},
+        local_work_size::Ref{NTuple{3, Csize_t}},
+        0::cl_uint,
+        C_NULL::Ptr{cl_event},
+        event::Ref{cl_event}
+    )::cl_int
+end
+
 @checked function clEnqueueNDRangeKernel(
         command_queue, kernel, work_dim,
         global_work_offset, global_work_size,
@@ -922,6 +958,18 @@ devices(p::Platform) = devices(p, CL_DEVICE_TYPE_ALL)
         clGetDeviceInfo(d, CL_DEVICE_EXTENSIONS, size[], result, C_NULL)
         bs = GC.@preserve result unsafe_string(pointer(result))
         return String[string(s) for s in split(bs)]
+    end
+
+    # cl_ext_float_atomics: per-precision bitfields of natively supported floating-point
+    # atomic operations (zero when the device does not expose the extension)
+    if s == :single_fp_atomic_capabilities || s == :double_fp_atomic_capabilities || s == :half_fp_atomic_capabilities
+        "cl_ext_float_atomics" in d.extensions || return zero(UInt64)
+        prop = s == :single_fp_atomic_capabilities ? CL_DEVICE_SINGLE_FP_ATOMIC_CAPABILITIES_EXT :
+            s == :double_fp_atomic_capabilities ? CL_DEVICE_DOUBLE_FP_ATOMIC_CAPABILITIES_EXT :
+            CL_DEVICE_HALF_FP_ATOMIC_CAPABILITIES_EXT
+        caps = Ref{UInt64}(0)
+        clGetDeviceInfo(d, prop, sizeof(UInt64), caps, C_NULL)
+        return caps[]
     end
 
     if s == :platform
@@ -1223,9 +1271,10 @@ function set_arg!(k::Kernel, idx::Integer, arg::LocalMem)
 end
 
 function set_arg!(k::Kernel, idx::Integer, arg::T) where {T}
-    ref = Ref(arg)
-    tsize = sizeof(ref)
-    err = unchecked_clSetKernelArg(k, cl_uint(idx - 1), tsize, ref)
+    # `Ref{T}` makes `ccall` pass a pointer to a stack copy of `arg`
+    err = @ccall libopencl.POclSetKernelArg(
+        k::cl_kernel, cl_uint(idx - 1)::cl_uint, sizeof(T)::Csize_t, arg::Ref{T}
+    )::cl_int
     if err == CL_INVALID_ARG_SIZE
         error(
             """Mismatch between Julia and OpenCL type for kernel argument $idx.
@@ -1244,19 +1293,36 @@ function set_arg!(k::Kernel, idx::Integer, arg::T) where {T}
     return k
 end
 
-function set_args!(k::Kernel, args...)
-    for (i, a) in enumerate(args)
-        set_arg!(k, i, a)
-    end
-    return
+set_args!(k::Kernel, args::Vararg{Any, N}) where {N} = _set_args!(k, 1, args...)
+@inline _set_args!(k::Kernel, i::Int) = nothing
+@inline function _set_args!(k::Kernel, i::Int, arg, args::Vararg{Any, N}) where {N}
+    set_arg!(k, i, arg)
+    return _set_args!(k, i + 1, args...)
 end
+
+# work sizes padded to the three dimensions OpenCL devices support
+const WorkSize = NTuple{3, Csize_t}
+@inline work_size(sizes) = ntuple(i -> i <= length(sizes) ? Csize_t(sizes[i]) : Csize_t(0), Val(3))
 
 function enqueue_kernel(
         k::Kernel, global_work_size, local_work_size = nothing;
         global_work_offset = nothing, rng_state = false, nargs = nothing
     )
-    max_work_dim = device().max_work_item_dims
     work_dim = length(global_work_size)
+
+    if global_work_offset === nothing && local_work_size !== nothing && !rng_state && work_dim <= 3
+        if length(local_work_size) != work_dim
+            throw(ArgumentError("global_work_size and local_work_size have differing dims"))
+        end
+        ret_event = Ref{cl_event}()
+        clEnqueueNDRangeKernel(
+            queue(), k, cl_uint(work_dim),
+            work_size(global_work_size), work_size(local_work_size), ret_event
+        )
+        return Event(ret_event[])
+    end
+
+    max_work_dim = device().max_work_item_dims
     if work_dim > max_work_dim
         throw(ArgumentError("global_work_size has max dim of $max_work_dim"))
     end
@@ -1323,19 +1389,19 @@ function enqueue_kernel(
 end
 
 function call(
-        k::Kernel, args...; global_size = (1,), local_size = nothing,
+        k::Kernel, args::Vararg{Any, N}; global_size = (1,), local_size = nothing,
         global_work_offset = nothing,
-        svm_pointers::Vector{Ptr{Cvoid}} = Ptr{Cvoid}[],
+        svm_pointers::Union{Nothing, Vector{Ptr{Cvoid}}} = nothing,
         rng_state = false
-    )
+    ) where {N}
     set_args!(k, args...)
-    if !isempty(svm_pointers)
+    if svm_pointers !== nothing && !isempty(svm_pointers)
         clSetKernelExecInfo(
             k, CL_KERNEL_EXEC_INFO_SVM_PTRS,
             sizeof(svm_pointers), svm_pointers
         )
     end
-    return enqueue_kernel(k, global_size, local_size; global_work_offset, rng_state, nargs = length(args))
+    return enqueue_kernel(k, global_size, local_size; global_work_offset, rng_state, nargs = N)
 end
 
 # convert the argument values to match the kernel's signature (specified by the user)

@@ -14,7 +14,7 @@ import Atomix: @atomic, @atomicswap, @atomicreplace
 using MacroTools
 using Adapt
 
-using KernelInterface: KernelInterface, Backend, GPU, get_backend, functional, synchronize, versioninfo, supports_unified, supports_float64, supports_atomics, copyto!, allocate, zeros, ones, device, device!, ndevices, priority!, pagelock!, unsafe_free!
+using KernelInterface: KernelInterface, Backend, GPU, get_backend, functional, synchronize, versioninfo, supports_unified, supports_float64, supports_atomics, copyto!, allocate, zeros, ones, device, device!, ndevices, priority!, pagelock!, unsafe_free!, record_event, wait_event
 import KernelInterface as KI
 export KernelInterface
 
@@ -70,7 +70,7 @@ synchronize(dev)
 ```
 """
 macro kernel(expr)
-    return __kernel(expr, #=force_inbounds=# false, #=unsafe_indices=# false)
+    return __kernel(expr, __source__, #=force_inbounds=# false, #=unsafe_indices=# false)
 end
 
 """
@@ -92,7 +92,7 @@ This allows for two different configurations:
 """
 macro kernel(ex...)
     if length(ex) == 1
-        return __kernel(ex[1], false, false)
+        return __kernel(ex[1], __source__, false, false)
     else
         unsafe_indices = false
         force_inbounds = false
@@ -116,7 +116,7 @@ macro kernel(ex...)
                 )
             end
         end
-        return __kernel(ex[end], force_inbounds, unsafe_indices)
+        return __kernel(ex[end], __source__, force_inbounds, unsafe_indices)
     end
 end
 
@@ -168,9 +168,7 @@ a tuple corresponding to kernel configuration. In order to get
 the total size you can use `prod(@groupsize())`.
 """
 macro groupsize()
-    return quote
-        $groupsize($(esc(:__ctx__)))
-    end
+    return :($groupsize($(esc(:__ctx__))))
 end
 
 """
@@ -180,9 +178,7 @@ Query the ndrange on the backend. This function returns
 a tuple corresponding to kernel configuration.
 """
 macro ndrange()
-    return quote
-        $size($ndrange($(esc(:__ctx__))))
-    end
+    return :($size($ndrange($(esc(:__ctx__)))))
 end
 
 """
@@ -194,9 +190,7 @@ macro localmem(T, dims)
     # Stay in sync with CUDAnative
     id = gensym("static_shmem")
 
-    return quote
-        $SharedMemory($(esc(T)), Val($(esc(dims))), Val($(QuoteNode(id))))
-    end
+    return :($SharedMemory($(esc(T)), Val($(esc(dims))), Val($(QuoteNode(id)))))
 end
 
 """
@@ -215,9 +209,7 @@ macro private(T, dims)
     if dims isa Integer
         dims = (dims,)
     end
-    return quote
-        $Scratchpad($(esc(:__ctx__)), $(esc(T)), Val($(esc(dims))))
-    end
+    return :($Scratchpad($(esc(:__ctx__)), $(esc(T)), Val($(esc(dims)))))
 end
 
 """
@@ -251,9 +243,7 @@ workgroup.
     `@synchronize()` must be encountered by all workitems of a work-group executing the kernel or by none at all.
 """
 macro synchronize()
-    return quote
-        $__synchronize()
-    end
+    return :($__synchronize())
 end
 
 """
@@ -273,9 +263,7 @@ workgroup. `cond` is not allowed to have any visible sideffects.
     Since v`0.9.34` this version of the macro is deprecated and lowers to `@synchronize()`
 """
 macro synchronize(cond)
-    return quote
-        $__synchronize()
-    end
+    return :($__synchronize())
 end
 
 """
@@ -340,9 +328,7 @@ macro print(items...)
         end
     end
 
-    return quote
-        $__print($(map(esc, args)...))
-    end
+    return :($__print($(map(esc, args)...)))
 end
 
 """
@@ -414,7 +400,7 @@ end
 @inline function __index_Global_Linear(ctx)
     I = @inbounds expand(__iterspace(ctx), KI.get_group_id().x, KI.get_local_id().x)
     # TODO: This is unfortunate, can we get the linear index cheaper
-    return @inbounds LinearIndices(__ndrange(ctx))[I]
+    return linear_index(__ndrange(ctx), I)
 end
 
 @inline function __index_Local_Cartesian(ctx)
@@ -433,7 +419,33 @@ end
 
 struct ConstAdaptor end
 
-Adapt.adapt_storage(::ConstAdaptor, a::Array) = Base.Experimental.Const(a)
+"""
+    adapt(backend::Backend, x)
+
+Convert `x` such that its array storage lives on `backend`. This is an extension of
+[Adapt.jl](https://github.com/JuliaGPU/Adapt.jl), and lets code move data to a backend
+without knowing the backend's array type:
+
+```julia
+using Adapt
+x = adapt(CUDABackend(), rand(Float32, 8))  # a CuArray
+y = adapt(CPU(), x)                         # an Array again
+```
+!!! note
+    Backend implementations **must** implement `Adapt.adapt_storage(::NewBackend, x)`.
+    Adapt.jl's fallback is the identity, so a backend that omits this method silently
+    leaves data where it is. The recommended definition delegates to the backend's array
+    type, so that `adapt(backend, x)` behaves exactly like `adapt(BackendArray, x)`:
+
+    ```julia
+    Adapt.adapt_storage(::CUDABackend, x) = adapt(CuArray, x)
+    ```
+
+!!! compat "KernelAbstractions 0.10"
+    `adapt(backend, x)` has been supported by the GPU backends since KernelAbstractions
+    0.9, but is only documented, and required of every backend, since 0.10.
+"""
+Adapt.adapt_storage(::Backend, x)
 
 constify(arg) = adapt(ConstAdaptor(), arg)
 
@@ -516,6 +528,8 @@ last (possibly partial) workgroup. Primarily used by backend implementations and
 @inline function partition(kernel, ndrange, workgroupsize)
     static_ndrange = KernelAbstractions.ndrange(kernel)
     static_workgroupsize = KernelAbstractions.workgroupsize(kernel)
+    ndrange = NDIteration.normalize_ndrange(ndrange)
+    workgroupsize = NDIteration.normalize_workgroupsize(workgroupsize)
 
     if ndrange === nothing && static_ndrange <: DynamicSize ||
             workgroupsize === nothing && static_workgroupsize <: DynamicSize
@@ -534,7 +548,7 @@ last (possibly partial) workgroup. Primarily used by backend implementations and
     end
 
     if static_ndrange <: StaticSize
-        if ndrange !== nothing && ndrange != get(static_ndrange)
+        if ndrange !== nothing && !NDIteration.same_axes(ndrange, get(static_ndrange))
             error("Static NDRange ($static_ndrange) and launch NDRange ($ndrange) differ")
         end
         ndrange = get(static_ndrange)
@@ -549,14 +563,16 @@ last (possibly partial) workgroup. Primarily used by backend implementations and
 
     @assert workgroupsize !== nothing
     @assert ndrange !== nothing
-    blocks, workgroupsize, dynamic = NDIteration.partition(ndrange, workgroupsize)
+    blocks, workgroupsize, dynamic = NDIteration.partition(extents(ndrange), workgroupsize)
 
     if static_ndrange <: StaticSize
         static_blocks = StaticSize{blocks}
         blocks = nothing
+        mapping = NDIteration.static_mapping(ndrange)
     else
         static_blocks = DynamicSize
         blocks = CartesianIndices(blocks)
+        mapping = NDIteration.dynamic_mapping(ndrange)
     end
 
     if static_workgroupsize <: StaticSize
@@ -566,7 +582,7 @@ last (possibly partial) workgroup. Primarily used by backend implementations and
         workgroupsize = CartesianIndices(workgroupsize)
     end
 
-    iterspace = NDRange{length(ndrange), static_blocks, static_workgroupsize}(blocks, workgroupsize)
+    iterspace = NDRange{length(ndrange), static_blocks, static_workgroupsize}(blocks, workgroupsize, mapping)
     return iterspace, dynamic
 end
 
@@ -592,6 +608,7 @@ function mkcontext end
 function launch_config end
 
 include("macros.jl")
+include("spawn.jl")
 
 ###
 # Backends/Interface

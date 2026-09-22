@@ -27,23 +27,29 @@ end
 
 
 include("test.jl")
+include("atomics.jl")
 include("hostinterface.jl")
 include("localmem.jl")
 include("private.jl")
 include("unroll.jl")
 include("nditeration.jl")
+include("offsets.jl")
 include("copyto.jl")
 include("devices.jl")
 include("print_test.jl")
-include("reflection.jl")
 include("examples.jl")
 include("convert.jl")
 include("specialfunctions.jl")
 include("random.jl")
+include("spawn.jl")
 
 function testsuite(backend, backend_str, backend_mod, AT, DAT; skip_tests = Set{String}())
     @conditional_testset "Unittests" skip_tests begin
         unittest_testsuite(backend, backend_str, backend_mod, DAT; skip_tests)
+    end
+
+    @conditional_testset "Atomics" skip_tests begin
+        atomics_testsuite(backend, AT)
     end
 
     @conditional_testset "SpecialFunctions" skip_tests begin
@@ -70,6 +76,10 @@ function testsuite(backend, backend_str, backend_mod, AT, DAT; skip_tests = Set{
         nditeration_testsuite()
     end
 
+    @conditional_testset "Offsets" skip_tests begin
+        offsets_testsuite(backend, AT)
+    end
+
     @conditional_testset "copyto!" skip_tests begin
         copyto_testsuite(backend, AT)
     end
@@ -82,10 +92,6 @@ function testsuite(backend, backend_str, backend_mod, AT, DAT; skip_tests = Set{
         printing_testsuite(backend)
     end
 
-    @conditional_testset "Reflection" skip_tests begin
-        reflection_testsuite(backend, backend_str, AT)
-    end
-
     @conditional_testset "Convert" skip_tests begin
         convert_testsuite(backend, AT)
     end
@@ -96,6 +102,10 @@ function testsuite(backend, backend_str, backend_mod, AT, DAT; skip_tests = Set{
 
     @conditional_testset "Random" skip_tests begin
         random_testsuite(backend)
+    end
+
+    @conditional_testset "Spawn" skip_tests begin
+        spawn_testsuite(backend, AT)
     end
 
     return

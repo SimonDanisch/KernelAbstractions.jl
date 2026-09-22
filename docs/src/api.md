@@ -37,6 +37,7 @@ GPU
 CPU
 POCLBackend
 get_backend
+Adapt.adapt_storage(::Backend, ::Any)
 KernelAbstractions.allocate
 KernelAbstractions.zeros
 KernelAbstractions.ones
@@ -54,6 +55,9 @@ KernelAbstractions.supports_float64
 
 ```@docs
 synchronize
+KernelAbstractions.@spawn
+KernelAbstractions.record_event
+KernelAbstractions.wait_event
 KernelAbstractions.device
 KernelAbstractions.ndevices
 KernelAbstractions.device!
@@ -71,12 +75,21 @@ KernelAbstractions.backend
 
 ## Reflection
 
-These macros help inspect the generated kernel code. LLVM IR reflection via
-[`@ka_code_llvm`](@ref) is only supported on the CPU backend.
+To look at the code a backend actually generates, wrap a kernel launch in one of the
+`@device_code_*` macros below. They work the same on the CPU backend and on GPU
+backends, and they are public, but not exported, so you must call them qualified:
+
+```julia
+KernelAbstractions.@device_code_llvm mul2(backend, 64)(A, ndrange=length(A))
+```
 
 ```@docs
-@ka_code_typed
-@ka_code_llvm
+KernelAbstractions.@device_code_lowered
+KernelAbstractions.@device_code_typed
+KernelAbstractions.@device_code_warntype
+KernelAbstractions.@device_code_llvm
+KernelAbstractions.@device_code_native
+KernelAbstractions.@device_code
 ```
 
 ## Internal
@@ -90,4 +103,10 @@ KernelAbstractions.@context
 KernelAbstractions.argconvert
 KernelAbstractions.NDIteration.DynamicSize
 KernelAbstractions.NDIteration.StaticSize
+KernelAbstractions.NDIteration.NDRange
+KernelAbstractions.NDIteration.StaticOffset
+KernelAbstractions.NDIteration.DynamicOffset
+KernelAbstractions.NDIteration.extents
+KernelAbstractions.NDIteration.offsets
+KernelAbstractions.NDIteration.linear_index
 ```
