@@ -157,6 +157,20 @@ function dFdx end
 @doc (@doc dFdx) function dFdy end
 
 """
+    discard()
+
+Drop this fragment. Nothing it has written is kept and the invocation ends
+here, so it is a control-flow terminator and not a value. Fragment stage only.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    @device_override discard()
+    ```
+"""
+function discard end
+
+"""
     set_point_size!(s::Float32)
 
 The size, in pixels, of the point this vertex becomes. Only meaningful when the
@@ -320,7 +334,7 @@ clip_y(y::Float32) = y
 
 # The host answers, which exist to SAY something rather than to work.
 for f in (:vertex_index, :instance_index, :frag_coord, :frag_coord_x, :frag_coord_y,
-          :frag_coord_z, :frag_coord_w, :frag_coord_xy, :dFdx, :dFdy,
+          :frag_coord_z, :frag_coord_w, :frag_coord_xy, :dFdx, :dFdy, :discard,
           :set_point_size!, :sample_texture_2d, :emit_vertex!, :end_primitive!,
           :primitive_id_in)
     @eval $f(args...) = error($(string(f)) * _GFX_OUTSIDE)
