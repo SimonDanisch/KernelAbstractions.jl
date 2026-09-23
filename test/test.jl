@@ -11,6 +11,12 @@ identity(x) = x
 struct UnknownAbstractVector <: AbstractVector{Float32}  # issue #588
 end
 
+# A user struct opted into `adapt`, as data passed to backends often is.
+struct AdaptWrapper{T}
+    x::T
+end
+Adapt.@adapt_structure AdaptWrapper
+
 function unittest_testsuite(Backend, backend_str, backend_mod, BackendArrayT; skip_tests = Set{String}())
     @conditional_testset "partition" skip_tests begin
         backend = Backend()
@@ -41,6 +47,47 @@ function unittest_testsuite(Backend, backend_str, backend_mod, BackendArrayT; sk
 
             @test_throws ErrorException KernelAbstractions.partition(kernel, (129,), nothing)
             @test KernelAbstractions.backend(kernel) == backend
+        end
+        let kernel = KernelAbstractions.Kernel{typeof(backend), StaticSize{(64,)}, DynamicSize, typeof(identity)}(backend, identity)
+            iterspace, dynamic = KernelAbstractions.partition(kernel, (-63:64,), nothing)
+            @test length(blocks(iterspace)) == 2
+            @test dynamic isa NoDynamicCheck
+            @test offsets(iterspace) == (-64,)
+            @test iterspace.mapping isa DynamicOffset
+
+            iterspace, dynamic = KernelAbstractions.partition(kernel, CartesianIndices((0:128,)), (64,))
+            @test length(blocks(iterspace)) == 3
+            @test dynamic isa DynamicCheck
+            @test offsets(iterspace) == (-1,)
+
+            iterspace, dynamic = KernelAbstractions.partition(kernel, 0:127, nothing)
+            @test length(blocks(iterspace)) == 2
+            @test offsets(iterspace) == (-1,)
+
+            iterspace, dynamic = KernelAbstractions.partition(kernel, (128,), nothing)
+            @test iterspace.mapping === nothing
+
+            # a range in place of the workgroup size is taken as its length
+            iterspace, dynamic = KernelAbstractions.partition(kernel, (-63:64,), (-63:0,))
+            @test length(blocks(iterspace)) == 2
+        end
+        let kernel = KernelAbstractions.Kernel{typeof(backend), StaticSize{(64,)}, StaticSize{(-63:64,)}, typeof(identity)}(backend, identity)
+            iterspace, dynamic = KernelAbstractions.partition(kernel, nothing, nothing)
+            @test length(blocks(iterspace)) == 2
+            @test dynamic isa NoDynamicCheck
+            @test offsets(iterspace) == (-64,)
+            @test iterspace.mapping isa StaticOffset
+
+            iterspace, dynamic = KernelAbstractions.partition(kernel, (-63:64,), nothing)
+            @test length(blocks(iterspace)) == 2
+
+            @test_throws ErrorException KernelAbstractions.partition(kernel, (128,), nothing)
+            @test_throws ErrorException KernelAbstractions.partition(kernel, (-62:65,), nothing)
+        end
+        let kernel = KernelAbstractions.Kernel{typeof(backend), StaticSize{(64,)}, StaticSize{(128,)}, typeof(identity)}(backend, identity)
+            iterspace, dynamic = KernelAbstractions.partition(kernel, (1:128,), nothing)
+            @test length(blocks(iterspace)) == 2
+            @test iterspace.mapping === nothing
         end
     end
 
@@ -119,10 +166,29 @@ function unittest_testsuite(Backend, backend_str, backend_mod, BackendArrayT; sk
 
     @conditional_testset "adapt" skip_tests begin
         backend = Backend()
+        backendT = typeof(backend).name.wrapper # To look through CUDABackend{true, false}
         x = allocate(backend, Float32, 5)
         @test adapt(CPU(), x) isa Array
         y = adapt(backend, Array{Float32}(undef, 5))
         @test typeof(y) == typeof(x)
+
+        # Data round-trips between the host and the backend.
+        host = rand(Float32, 5)
+        dev = adapt(backend, host)
+        @test KernelAbstractions.get_backend(dev) isa backendT
+        @test Array(dev) == host
+        @test adapt(CPU(), dev) == host
+        @test adapt(backend, dev) === dev
+
+        # Scalars pass through, and Adapt.jl traverses the structure around the arrays.
+        @test adapt(backend, 1.0f0) === 1.0f0
+        nt = adapt(backend, (a = host, b = 1.0f0))
+        @test typeof(nt.a) == typeof(dev)
+        @test nt.b === 1.0f0
+        @test typeof(adapt(backend, AdaptWrapper(host)).x) == typeof(dev)
+        v = adapt(backend, view(host, 2:4))
+        @test v isa SubArray
+        @test typeof(parent(v)) == typeof(dev)
     end
 
     # TODO: add test for _group and _local_cartesian
@@ -199,36 +265,28 @@ function unittest_testsuite(Backend, backend_str, backend_mod, BackendArrayT; sk
         @inbounds A[I] = B[I]
     end
 
+    @kernel function constarg2d(A, @Const(B))
+        i, j = @index(Global, NTuple)
+        @inbounds A[i, j] = B[i, j]
+    end
+
     @conditional_testset "Const" skip_tests begin
         let kernel = constarg(Backend(), 8, (1024,))
             # this is poking at internals
             iterspace = NDRange{1, StaticSize{(128,)}, StaticSize{(8,)}}()
-            ctx = if Backend == CPU
-                KernelAbstractions.mkcontext(kernel, 1, nothing, iterspace, Val(NoDynamicCheck()))
-            else
-                KernelAbstractions.mkcontext(kernel, nothing, iterspace)
-            end
-            AT = if Backend == CPU
-                Array{Float32, 2}
-            else
-                BackendArrayT{Float32, 2, 1} # AS 1
-            end
+            ctx = KernelAbstractions.mkcontext(kernel, nothing, iterspace)
+            AT = BackendArrayT{Float32, 2, 1} # AS 1
             IR = sprint() do io
-                if backend_str == "CPU"
-                    code_llvm(
-                        io, kernel.f, (typeof(ctx), AT, AT),
-                        optimize = false, raw = true,
-                    )
-                else
-                    backend_mod.code_llvm(
-                        io, kernel.f, (typeof(ctx), AT, AT),
-                        kernel = true, optimize = true,
-                    )
-                end
+                backend_mod.code_llvm(
+                    io, kernel.f, (typeof(ctx), AT, AT),
+                    kernel = true, optimize = true,
+                    # the annotation we look for on POCL is metadata, which is only
+                    # printed in raw mode
+                    raw = backend_str == "CPU",
+                )
             end
             if backend_str == "CPU"
-                @test occursin("!alias.scope", IR)
-                @test occursin("!noalias", IR)
+                @test occursin("!invariant.load", IR)
             elseif backend_str == "CUDA"
                 if Base.libllvm_version >= v"20"
                     @test occursin("addrspace(1)", IR)
@@ -241,6 +299,20 @@ function unittest_testsuite(Backend, backend_str, backend_mod, BackendArrayT; sk
                 @test_skip false
             end
         end
+
+        # a constified argument must still read back the values it was given,
+        # both linearly and as an N-d index
+        A = KernelAbstractions.zeros(Backend(), Float32, 1024)
+        B = KernelAbstractions.ones(Backend(), Float32, 1024)
+        constarg(Backend(), 8)(A, B, ndrange = length(A))
+        synchronize(Backend())
+        @test all(Array(A) .== 1.0f0)
+
+        A = KernelAbstractions.zeros(Backend(), Float32, 32, 32)
+        B = KernelAbstractions.ones(Backend(), Float32, 32, 32)
+        constarg2d(Backend(), (8, 8))(A, B, ndrange = size(A))
+        synchronize(Backend())
+        @test all(Array(A) .== 1.0f0)
     end
 
     @kernel function kernel_val!(a, ::Val{m}) where {m}
@@ -417,6 +489,31 @@ function unittest_testsuite(Backend, backend_str, backend_mod, BackendArrayT; sk
         fill!(output, 0)
         unaliased_accumulate_local!(backend)(output, input, N; ndrange = size(output))
         @test adapt(Array, output) == reference
+    end
+
+    # from https://github.com/JuliaGPU/KernelAbstractions.jl/issues/760
+    @kernel function ifelse_pick!(out, x, y, flag)
+        i = @index(Global, Linear)
+        @inbounds out[i] = ifelse(flag[i], x[i], y[i])
+    end
+
+    @testset "ifelse on aggregate types" begin
+        backend = Backend()
+        eltypes = [ComplexF32]
+        KernelAbstractions.supports_float64(backend) && push!(eltypes, ComplexF64)
+        @testset "$T" for T in eltypes
+            n = 8
+            x = rand(T, n)
+            y = rand(T, n)
+            flag = rand(Bool, n)
+            dx = adapt(backend, x)
+            dy = adapt(backend, y)
+            dflag = adapt(backend, flag)
+            out = KernelAbstractions.zeros(backend, T, n)
+            ifelse_pick!(backend, 4)(out, dx, dy, dflag; ndrange = n)
+            synchronize(backend)
+            @test Array(out) == ifelse.(flag, x, y)
+        end
     end
 
     return

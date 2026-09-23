@@ -46,6 +46,72 @@ function test_subgroup_kernel(results)
     return
 end
 
+# The interface documents a concrete return type for each device-side function;
+# these kernels record whether the backend honors them.
+const WorkItemNT{T} = @NamedTuple{x::T, y::T, z::T}
+
+function typecheck_kernel(results)
+    @inbounds begin
+        results[1] = KI.get_global_size() isa WorkItemNT{Int}
+        results[2] = KI.get_global_id() isa WorkItemNT{Int}
+        results[3] = KI.get_local_size() isa WorkItemNT{Int}
+        results[4] = KI.get_local_id() isa WorkItemNT{Int}
+        results[5] = KI.get_num_groups() isa WorkItemNT{Int}
+        results[6] = KI.get_group_id() isa WorkItemNT{Int}
+    end
+    return
+end
+
+# The indexing queries take an element type; the result must use it.
+function typed_typecheck_kernel(results, ::Type{T}) where {T}
+    @inbounds begin
+        results[1] = KI.get_global_size(T) isa WorkItemNT{T}
+        results[2] = KI.get_global_id(T) isa WorkItemNT{T}
+        results[3] = KI.get_local_size(T) isa WorkItemNT{T}
+        results[4] = KI.get_local_id(T) isa WorkItemNT{T}
+        results[5] = KI.get_num_groups(T) isa WorkItemNT{T}
+        results[6] = KI.get_group_id(T) isa WorkItemNT{T}
+    end
+    return
+end
+
+# Records the typed indexing queries for every work-item, so the host can check
+# that they agree with the default `Int` form across all three dimensions.
+# `results` is `(work-items, 18)`: one row per work-item, holding the `x`, `y`
+# and `z` components of each of the six queries in turn.
+function typed_index_kernel(results, ::Type{T}) where {T}
+    i, j, k = KI.get_global_id(T)
+    ni, nj, _ = KI.get_global_size(T)
+    lin = (k - one(T)) * ni * nj + (j - one(T)) * ni + i
+
+    if lin <= size(results, 1)
+        vals = (
+            KI.get_global_size(T)..., KI.get_global_id(T)..., KI.get_local_size(T)...,
+            KI.get_local_id(T)..., KI.get_num_groups(T)..., KI.get_group_id(T)...,
+        )
+        for q in 1:18
+            @inbounds results[lin, q] = vals[q]
+        end
+    end
+    return
+end
+
+function subgroup_typecheck_kernel(results, val::T) where {T}
+    # uniformly executed by the whole sub-group, as `shfl_down` requires
+    shuffled = KI.shfl_down(val, 0x00000001)
+    if KI.get_sub_group_local_id() == 1
+        @inbounds begin
+            results[1] = KI.get_sub_group_size() isa UInt32
+            results[2] = KI.get_max_sub_group_size() isa UInt32
+            results[3] = KI.get_num_sub_groups() isa UInt32
+            results[4] = KI.get_sub_group_id() isa UInt32
+            results[5] = KI.get_sub_group_local_id() isa UInt32
+            results[6] = shuffled isa T
+        end
+    end
+    return
+end
+
 function shfl_down_test_kernel(a, b, ::Val{N}) where {N}
     idx = KI.get_sub_group_local_id()
 
@@ -139,6 +205,71 @@ function interface_testsuite(backend, AT)
         @test_throws ArgumentError (KI.@kernel backend() numworkgroups = (2, 2, 2) workgroupsize = (2, 2, 2, 2) launch_kernel3d(arr3d))
     end
 
+    @testset "Host return types" begin
+        b = backend()
+
+        @test KI.supports_unified(b) isa Bool
+        @test KI.supports_atomics(b) isa Bool
+        @test KI.supports_float64(b) isa Bool
+        @test KI.functional(b) isa Union{Missing, Bool}
+
+        @test KI.device(b) isa Int
+        @test KI.ndevices(b) isa Int
+        # @test KI.device!(b, KI.device(b)) isa Nothing
+        # @test KI.priority!(b, :normal) isa Nothing
+
+        @test KI.shfl_down_types(b) isa Vector{DataType}
+
+        arr = KI.allocate(b, Float32, 2)
+        @test arr isa AT{Float32, 1}
+        @test KI.zeros(b, Float32, 2) isa AT{Float32, 1}
+        @test KI.ones(b, Float32, 2) isa AT{Float32, 1}
+        @test KI.get_backend(arr) isa KI.Backend
+
+    end
+
+    @testset "Device return types" begin
+        results = KI.zeros(backend(), Bool, 6)
+        KI.@kernel backend() typecheck_kernel(results)
+        KI.synchronize(backend())
+        @test all(Array(results))
+
+        @testset "$T" for T in (Int32, Int64, UInt32, UInt64)
+            typed_results = KI.zeros(backend(), Bool, 6)
+            KI.@kernel backend() typed_typecheck_kernel(typed_results, T)
+            KI.synchronize(backend())
+            @test all(Array(typed_results))
+        end
+    end
+
+    @testset "Typed indexing" begin
+        workgroupsize = (2, 2, 2)
+        numworkgroups = (3, 2, 1)
+        N = prod(workgroupsize) * prod(numworkgroups)
+
+        # `Int` is the reference: it is what the zero-argument form returns.
+        function run_typed(::Type{T}) where {T}
+            results = KI.zeros(backend(), T, N, 18)
+            KI.@kernel backend() workgroupsize = workgroupsize numworkgroups = numworkgroups typed_index_kernel(results, T)
+            KI.synchronize(backend())
+            return Array(results)
+        end
+        reference = run_typed(Int)
+
+        global_size = workgroupsize .* numworkgroups
+        @test all(eachrow(reference[:, 1:3]) .== Ref(collect(global_size)))
+        @test all(eachrow(reference[:, 7:9]) .== Ref(collect(workgroupsize)))
+        @test all(eachrow(reference[:, 13:15]) .== Ref(collect(numworkgroups)))
+        # every global id is seen exactly once
+        @test sort(Tuple.(eachrow(reference[:, 4:6]))) == sort(vec(Tuple.(CartesianIndices(global_size))))
+
+        @testset "$T" for T in (Int32, UInt32, UInt64)
+            typed = run_typed(T)
+            @test typed isa AbstractMatrix{T}
+            @test typed == reference
+        end
+    end
+
     @testset "Basic interface functionality" begin
 
         @test KI.max_work_group_size(backend()) isa Int
@@ -184,6 +315,16 @@ function interface_testsuite(backend, AT)
 
     # Used as a proxy for sub-group support
     if !isempty(KI.shfl_down_types(backend()))
+        @testset "Sub-group return types" begin
+            @test KI.sub_group_size(backend()) isa Int
+
+            T = first(setdiff(KI.shfl_down_types(backend()), [Bool]))
+            results = KI.zeros(backend(), Bool, 6)
+            KI.@kernel backend() workgroupsize = KI.sub_group_size(backend()) subgroup_typecheck_kernel(results, one(T))
+            KI.synchronize(backend())
+            @test all(Array(results))
+        end
+
         @testset "Sub-groups" begin
             @test KI.sub_group_size(backend()) isa Int
 

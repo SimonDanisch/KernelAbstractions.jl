@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1.11', '1.12', '1.13-nightly']
+        version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
         os: [ubuntu-24.04, ubuntu-24.04-arm, macOS-15-intel, macOS-15, windows-2022]
         arch: [x64, arm64]
         pocl: [jll, local]
@@ -142,18 +142,43 @@ jobs:
       #         end
       #       end
       #     '
+      # Nightly tracks the next Julia release; don't fail CI on it
       - uses: julia-actions/julia-buildpkg@v1
+        continue-on-error: ${{ matrix.version == 'nightly' }}
+      # Known limitation: `[sources]` is only supported from Julia 1.11 on, so on 1.10
+      # the `KernelInterface = {path = "lib/KernelInterface"}` entry in Project.toml is
+      # silently ignored and Pkg resolves KernelInterface from the registry instead --
+      # a stale release that need not have the features this repo's copy adds. Dev it
+      # explicitly so 1.10 tests the copy in this repo, like 1.11+ already do.
+      #
+      # Required on every platform. Windows runs its tests de-escalated below, but that
+      # applies to the test run only, not to `Pkg.develop`.
+      - name: Dev KernelInterface
+        shell: bash
+        run: julia -e 'using Pkg; Pkg.activate("."); Pkg.develop(; path="lib/KernelInterface")'
       - uses: julia-actions/julia-runtest@v1
         if: runner.os != 'Windows'
+        continue-on-error: ${{ matrix.version == 'nightly' }}
         with:
           annotate: true
       - name: Setup BusyBox
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Invoke-WebRequest https://frippery.org/files/busybox/busybox64.exe -OutFile C:\Windows\drop.exe
+          $attempts = 5
+          for ($i = 1; $i -le $attempts; $i++) {
+            try {
+              Invoke-WebRequest https://frippery.org/files/busybox/busybox64.exe -OutFile C:\Windows\drop.exe
+              break
+            } catch {
+              if ($i -eq $attempts) { throw }
+              Write-Host "Download failed (attempt $i/$attempts): $($_.Exception.Message). Retrying in 10s..."
+              Start-Sleep -Seconds 10
+            }
+          }
       - name: Test KernelAbstractions.jl (de-escalated)
         if: runner.os == 'Windows'
+        continue-on-error: ${{ matrix.version == 'nightly' }}
         shell: drop -c "julia '{0}'"
         run: |
           using Pkg
@@ -170,7 +195,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1.11', '1.12', '1.13-nightly']
+        version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
         os: [ubuntu-24.04, macOS-15, windows-2022]
     steps:
       - uses: actions/checkout@v7
@@ -181,9 +206,11 @@ jobs:
       # Tested on its own, without KernelAbstractions, to keep the sibling
       # package standalone and dependency-free.
       - uses: julia-actions/julia-buildpkg@v1
+        continue-on-error: ${{ matrix.version == 'nightly' }}
         with:
           project: lib/KernelInterface
       - uses: julia-actions/julia-runtest@v1
+        continue-on-error: ${{ matrix.version == 'nightly' }}
         with:
           project: lib/KernelInterface
           annotate: true
@@ -194,7 +221,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1.11', '1.12', '1.13']
+        version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/install-juliaup@v3
@@ -202,22 +229,28 @@ jobs:
           channel: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
-      - name: "Developing OpenCL"
-        run: |
-          julia -e 'println("--- :julia: Developing OpenCL")
-                using Pkg
-                Pkg.add(url="https://github.com/christiangnrd/OpenCL.jl", rev="intrinsics")
-                Pkg.develop(; name="SPIRVIntrinsics")'
+        continue-on-error: ${{ matrix.version == 'nightly' }}
+      # KernelInterface is dev'ed explicitly here for the same reason as in the CI job
+      # above: Julia 1.10 does not support `[sources]`.
       - name: "Instantiating project"
         run: |
           julia -e 'println("--- :julia: Instantiating project")
                 using Pkg
-                Pkg.develop(; path=pwd())' || exit 3
+                Pkg.develop([PackageSpec(; name="KernelAbstractions", path=pwd()),
+                PackageSpec(; name="KernelInterface", path=joinpath(pwd(), "lib", "KernelInterface"))])' || exit 3
       - name: "Developing OpenCL"
+        continue-on-error: ${{ matrix.version == 'nightly' }}
+        run: |
+          julia -e 'println("--- :julia: Developing OpenCL")
+                using Pkg
+                Pkg.add(url="https://github.com/JuliaGPU/OpenCL.jl", rev="intrinsics")
+                Pkg.develop(; name="SPIRVIntrinsics")'
+      - name: "Running tests"
+        continue-on-error: ${{ matrix.version == 'nightly' }}
         run: |
           julia -e 'println("+++ :julia: Running tests")
                 using Pkg
-                Pkg.test("OpenCL"; coverage=true, test_args=`--platform=pocl pocl/kernelabstractions poclc/kernelabstractions pocl/kernelintrinsics poclc/kernelintrinsics`)'
+                Pkg.test("OpenCL"; coverage=true, test_args=`--platform=pocl pocl/kernelabstractions poclc/kernelabstractions pocl/kernelinterface poclc/kernelinterface`)'
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v7
         with:

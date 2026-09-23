@@ -1,6 +1,7 @@
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+FileCheck = "4e644321-382b-4b05-b0b6-5d23c3d944fb"
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 KernelInterface = "4ee993da-d684-4d17-a7dd-4e58e78d92bf"
@@ -10,6 +11,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 pocl_standalone_jll = "54f56a70-6062-5590-a942-1226658f6c83"
 
 [sources]
@@ -18,3 +20,4 @@ KernelInterface = {path = "../lib/KernelInterface"}
 
 [compat]
 Aqua = "0.8"
+FileCheck = "1.2"

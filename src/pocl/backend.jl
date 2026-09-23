@@ -34,7 +34,7 @@ function KI.versioninfo(io::IO, ::POCLBackend)
     println(io)
 
     println(io, "Julia packages:")
-    for name in [:GPUCompiler, :LLVM, :SPIRVIntrinsics]
+    for name in [:GPUCompiler, :LLVM, :KernelInterface, :SPIRVIntrinsics]
         mod = getfield(POCL, name)
         println(io, "- $(name): $(Base.pkgversion(mod))")
     end
@@ -76,6 +76,15 @@ end
 ## Memory Operations
 
 KI.allocate(::POCLBackend, ::Type{T}, dims::Tuple; unified::Bool = false) where {T} = Array{T}(undef, dims)
+
+#  Adapt.jl's `Array` rule converts every `AbstractArray` leaf; `isbits` arrays (ranges, view indices)
+# which we want to keep as they are.
+Adapt.adapt_storage(::POCLBackend, x::AbstractArray) = isbits(x) ? x : Adapt.adapt(Array, x)
+
+# `@Const` applies `constify` inside the kernel, where arguments have already been
+# converted to device arrays, so the rule has to be registered for `CLDeviceArray`
+# rather than for `Array`.
+Adapt.adapt_storage(::KA.ConstAdaptor, a::POCL.CLDeviceArray) = Base.Experimental.Const(a)
 
 
 # Initialized
@@ -181,7 +190,7 @@ function threads_to_workgroupsize(threads, ndrange)
     end
 end
 
-function (obj::KA.Kernel{POCLBackend})(args...; ndrange = nothing, workgroupsize = nothing)
+function (obj::KA.Kernel{POCLBackend})(args::Vararg{Any, N}; ndrange = nothing, workgroupsize = nothing) where {N}
     ndrange, workgroupsize, iterspace, dynamic =
         KA.launch_config(obj, ndrange, workgroupsize)
 
@@ -192,7 +201,7 @@ function (obj::KA.Kernel{POCLBackend})(args...; ndrange = nothing, workgroupsize
     # figure out the optimal workgroupsize automatically
     if KA.workgroupsize(obj) <: KA.DynamicSize && workgroupsize === nothing
         wg_info = cl.work_group_info(kernel.fun, device())
-        wg_size_nd = threads_to_workgroupsize(wg_info.size, ndrange)
+        wg_size_nd = threads_to_workgroupsize(wg_info.size, KA.NDIteration.extents(ndrange))
         iterspace, dynamic = KA.partition(obj, ndrange, wg_size_nd)
         ctx = KA.mkcontext(obj, ndrange, iterspace)
     end
@@ -281,39 +290,39 @@ end
 
 ## Indexing Functions
 
-@device_override @inline function KI.get_local_id()
-    return (; x = Int(get_local_id(1)), y = Int(get_local_id(2)), z = Int(get_local_id(3)))
+@device_override @inline function KI.get_local_id(::Type{T}) where {T}
+    return (; x = T(get_local_id(1)), y = T(get_local_id(2)), z = T(get_local_id(3)))
 end
 
-@device_override @inline function KI.get_group_id()
-    return (; x = Int(get_group_id(1)), y = Int(get_group_id(2)), z = Int(get_group_id(3)))
+@device_override @inline function KI.get_group_id(::Type{T}) where {T}
+    return (; x = T(get_group_id(1)), y = T(get_group_id(2)), z = T(get_group_id(3)))
 end
 
-@device_override @inline function KI.get_global_id()
-    return (; x = Int(get_global_id(1)), y = Int(get_global_id(2)), z = Int(get_global_id(3)))
+@device_override @inline function KI.get_global_id(::Type{T}) where {T}
+    return (; x = T(get_global_id(1)), y = T(get_global_id(2)), z = T(get_global_id(3)))
 end
 
-@device_override @inline function KI.get_local_size()
-    return (; x = Int(get_local_size(1)), y = Int(get_local_size(2)), z = Int(get_local_size(3)))
+@device_override @inline function KI.get_local_size(::Type{T}) where {T}
+    return (; x = T(get_local_size(1)), y = T(get_local_size(2)), z = T(get_local_size(3)))
 end
 
-@device_override @inline function KI.get_num_groups()
-    return (; x = Int(get_num_groups(1)), y = Int(get_num_groups(2)), z = Int(get_num_groups(3)))
+@device_override @inline function KI.get_num_groups(::Type{T}) where {T}
+    return (; x = T(get_num_groups(1)), y = T(get_num_groups(2)), z = T(get_num_groups(3)))
 end
 
-@device_override @inline function KI.get_global_size()
-    return (; x = Int(get_global_size(1)), y = Int(get_global_size(2)), z = Int(get_global_size(3)))
+@device_override @inline function KI.get_global_size(::Type{T}) where {T}
+    return (; x = T(get_global_size(1)), y = T(get_global_size(2)), z = T(get_global_size(3)))
 end
 
-@device_override KI.get_sub_group_size() = get_sub_group_size()
+@device_override KI.get_sub_group_size() = get_sub_group_size() % UInt32
 
-@device_override KI.get_max_sub_group_size() = get_max_sub_group_size()
+@device_override KI.get_max_sub_group_size() = get_max_sub_group_size() % UInt32
 
-@device_override KI.get_num_sub_groups() = get_num_sub_groups()
+@device_override KI.get_num_sub_groups() = get_num_sub_groups() % UInt32
 
-@device_override KI.get_sub_group_id() = get_sub_group_id()
+@device_override KI.get_sub_group_id() = get_sub_group_id() % UInt32
 
-@device_override KI.get_sub_group_local_id() = get_sub_group_local_id()
+@device_override KI.get_sub_group_local_id() = get_sub_group_local_id() % UInt32
 
 @device_override @inline function KA.__validindex(ctx)
     if KA.__dynamic_checkbounds(ctx)

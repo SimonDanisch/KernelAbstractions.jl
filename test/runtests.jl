@@ -1,17 +1,65 @@
 using KernelAbstractions
+using Random
 using Test
 
 include("quality_assurance.jl")
+include("linenumbers.jl")
+include("coverage.jl")
 include("testsuite.jl")
+include("codegen.jl")
 
 @testset "Quality assurance" begin
     quality_assurance_testsuite()
+end
+
+@testset "Line numbers" begin
+    LineNumbers.linenumbers_testsuite()
+end
+
+@testset "Coverage" begin
+    Coverage.coverage_testsuite()
 end
 
 KernelAbstractions.versioninfo(POCLBackend())
 @info "Configuration" pocl = KernelAbstractions.POCL.nanoOpenCL.pocl_standalone_jll.libpocl
 
 import KernelAbstractions.POCL: POCL, @opencl, @device_code_llvm
+
+@testset "POCL float atomics" begin
+    # pocl's CPU device natively supports float add and min/max atomics in both global
+    # and local memory, so the SPIR-V extensions guarding them must be permitted
+    dev = POCL.device()
+    exts = split(POCL.default_spirv_extensions(dev), ",")
+    @test "+SPV_EXT_shader_atomic_float_add" in exts
+    @test "+SPV_EXT_shader_atomic_float_min_max" in exts
+    @test dev.half_fp_atomic_capabilities == 0
+    # an explicit list overrides the device-derived default
+    config = POCL.compiler_config(dev; extensions = "+SPV_KHR_expect_assume")
+    @test config.target.extensions == "+SPV_KHR_expect_assume"
+end
+
+# `randn`/`randexp` for Float16 route through Random's table-free fallback, whose polar
+# transform overflows in Float16 and whose `log1p` isn't available for Float16 on the
+# device. The device overlays compute in Float32 and convert, so results stay finite.
+if "cl_khr_fp16" in POCL.device().extensions
+    @testset "POCL device RNG: Float16" begin
+        @kernel function f16_rng_kernel(A, B)
+            i = @index(Global, Linear)
+            @inbounds A[i] = Random.randn(Float16)
+            @inbounds B[i] = Random.randexp(Float16)
+        end
+
+        # the overflow this guards against hits a few hundred values in 2^20 draws,
+        # so a small sample would not catch a regression
+        len = 2^20
+        a = KernelAbstractions.zeros(POCLBackend(), Float16, len)
+        b = KernelAbstractions.zeros(POCLBackend(), Float16, len)
+        f16_rng_kernel(POCLBackend())(a, b; ndrange = len)
+        KernelAbstractions.synchronize(POCLBackend())
+        @test all(isfinite, a)
+        @test all(isfinite, b)
+    end
+end
 
 @testset "POCL compilation cache" begin
     mod = @eval module $(gensym())
@@ -55,9 +103,28 @@ import KernelAbstractions.POCL: POCL, @opencl, @device_code_llvm
     @test count() == n + 2
 end
 
+@testset "CPU Codegen" begin
+    Codegen.codegen_testsuite()
+end
+
+@testset "Device code reflection" begin
+    @kernel function reflect_mul2(A)
+        i = @index(Global, Linear)
+        @inbounds A[i] = 2 * A[i]
+    end
+
+    A = KernelAbstractions.ones(POCLBackend(), Float32, 64)
+    ir = sprint() do io
+        KernelAbstractions.@device_code_llvm io = io debuginfo = :none reflect_mul2(POCLBackend(), 16)(A, ndrange = 64)
+    end
+    @test occursin("reflect_mul2", ir)
+    # the wrapped expression is evaluated, not just compiled
+    KernelAbstractions.synchronize(POCLBackend())
+    @test all(==(2.0f0), A)
+end
+
 @testset "CPU back-end" begin
-    struct CPUBackendArray{T, N, A} end # Fake and unused
-    Testsuite.testsuite(CPU, "CPU", Base, Array, CPUBackendArray)
+    Testsuite.testsuite(CPU, "CPU", POCL, Array, POCL.CLDeviceArray)
 end
 
 struct NewBackend <: KernelAbstractions.GPU end
