@@ -328,8 +328,10 @@ end
 ## Shared and Scratch Memory
 
 @device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
-    ptr = POCL.emit_localmemory(T, Val(prod(Dims)), Val(Id))
-    CLDeviceArray(Dims, ptr)
+    # `CLLocalArray` and not `emit_localmemory` directly: the generator takes
+    # `(T, len)` and has no room for `Id`, so the distinctness `Id` promises is
+    # arranged by the element type it is given. See `LocalTag`.
+    POCL.CLLocalArray(T, Dims, Val(Id))
 end
 
 @device_override @inline function KA.Scratchpad(ctx, ::Type{T}, ::Val{Dims}) where {T, Dims}

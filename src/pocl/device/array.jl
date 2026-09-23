@@ -256,3 +256,35 @@ end
     ptr = emit_localmemory(T, Val(len))
     return CLDeviceArray(dims, ptr)
 end
+
+"""
+    LocalTag{T,Id}
+
+`T` under a name that depends on `Id`, and nothing else.
+
+`emit_localmemory` is `@generated`, so its module-level global is shared by every
+call that reaches the same instantiation — and its parameters are `(T, len)`
+only. Two buffers of the same element type and the same length are therefore ONE
+buffer, which is the fault `KernelInterface.localmemory`'s `Id` exists to
+prevent: a tiled matmul stages two tiles of the same type and shape, the second
+write lands on the first tile, and the kernel runs and is wrong.
+
+Wrapping the element type is how the `Id` reaches a generator that does not take
+one. `LocalTag{T,Id}` is `isbits` with `T`'s size and alignment, so the storage
+is identical and only the cache key differs.
+"""
+struct LocalTag{T, Id}
+    v::T
+end
+
+"""
+Workgroup memory for `dims` of `T`, distinct per `Id`.
+
+The three-argument form `KernelInterface.localmemory` requires. `POCL` had a
+call to this and no method, so every kernel with a tile failed to compile.
+"""
+@inline function CLLocalArray(::Type{T}, dims, ::Val{Id}) where {T, Id}
+    len = prod(dims)
+    ptr = emit_localmemory(LocalTag{T, Id}, Val(len))
+    return CLDeviceArray(dims, reinterpret(LLVMPtr{T, AS.Workgroup}, ptr))
+end
