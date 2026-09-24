@@ -159,8 +159,18 @@ function dFdx end
 """
     discard()
 
-Drop this fragment. Nothing it has written is kept and the invocation ends
-here, so it is a control-flow terminator and not a value. Fragment stage only.
+Throw this fragment away: it contributes no colour and, crucially, no DEPTH.
+Fragment stage only.
+
+The depth half is the reason this exists. A blended pass that writes depth has
+an alpha-zero corner of a glyph or marker quad occlude whatever should have
+shown through it, because depth is written before blending ever looks at alpha.
+Discarding is what lets a blended pass keep a depth buffer at all.
+
+Execution CONTINUES past the call and the shader still returns a colour, which
+is simply not used. This is not a `return`, and every backend's primitive
+behaves that way: MSL's `discard_fragment()` and SPIR-V's demote both mark the
+invocation and carry on.
 
 !!! note
     Backend implementations **must** implement:
