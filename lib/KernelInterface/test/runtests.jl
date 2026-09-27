@@ -397,6 +397,14 @@ end
 
     # An explicit workgroupsize is kept as-is.
     @test KI.auto_launch_sizes(kernel, (), (16,), (100,)) === ((7,), (16,))
+    @test KI.auto_launch_sizes(kernel, (), 16, 100) === (7, 16)
+
+    # One with fewer axes than the range is 1 along the rest. It was broadcast
+    # over every axis, so `(96, 4, 5)` in groups of `(32,)` launched `(3, 1, 1)`
+    # workgroups and all but the first slice of the other two axes never ran:
+    # every head after the first of a flash attention, on ROCm.
+    @test KI.auto_launch_sizes(kernel, (), (32,), (96, 4, 5)) === ((3, 4, 5), (32, 1, 1))
+    @test KI.auto_launch_sizes(kernel, (), (8, 2), (64, 4, 3)) === ((8, 2, 3), (8, 2, 1))
 
     # A zero-sized ndrange yields zero workgroups; backends skip the launch.
     @test KI.auto_launch_sizes(kernel, (), (), (0,)) === ((0,), (1,))

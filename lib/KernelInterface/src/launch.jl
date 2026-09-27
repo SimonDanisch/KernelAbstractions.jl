@@ -65,6 +65,16 @@ function threads_to_workgroupsize(threads, ndrange)
     end
 end
 
+# A workgroup of fewer axes than the range is 1 along the rest, which
+# `check_launch_args` allows. `cld.(ndrange, workgroupsize)` broadcast a one-axis
+# `workgroupsize` over EVERY axis instead: `(96, 4, 5)` in groups of `(32,)` gave
+# `(3, 1, 1)` workgroups, so the other axes were divided by 32 and everything past
+# their first slice never ran. Tuples only: an integer range with an integer group
+# is one axis already, and answers in integers.
+padgroup(workgroupsize::Tuple, ndrange::Tuple) =
+    ntuple(i -> i <= length(workgroupsize) ? workgroupsize[i] : 1, length(ndrange))
+padgroup(workgroupsize, ndrange) = workgroupsize
+
 """
     auto_launch_sizes(kernel::KI.Kernel, numworkgroups, workgroupsize, ndrange, [max_work_items])
 
@@ -88,7 +98,7 @@ writing their own heuristic for calculating launch size.
             max_wgs = kernel_max_work_group_size(kernel; max_work_items = min(prod(ndrange), max_work_items))
             threads_to_workgroupsize(max_wgs, ndrange)
         else
-            workgroupsize
+            padgroup(workgroupsize, ndrange)
         end
         numworkgroups = cld.(ndrange, workgroupsize)
         Int.(numworkgroups), Int.(workgroupsize)
