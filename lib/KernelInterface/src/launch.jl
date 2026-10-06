@@ -141,6 +141,39 @@ kernel launch with too big a workgroup is attempted.
 function max_work_group_size end
 
 """
+    max_work_group_dims(backend)::NTuple{3, Int}
+
+The maximum number of work-items along each dimension of a work-group, for the active
+device of `backend`. [`max_work_group_size`](@ref) bounds their product.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    max_work_group_dims(backend::NewBackend)::NTuple{3, Int}
+    ```
+"""
+function max_work_group_dims end
+
+"""
+    max_num_groups(backend)::NTuple{3, Int}
+
+The maximum number of work-groups along each dimension of a launch, for the active device
+of `backend`.
+
+This is conservative: a launch within these limits works for any work-group size (as long
+as the number of work-items in each dimension fits an `Int`), but some backends accept more
+work-groups for smaller work-groups (e.g. HIP bounds the number of work-items per
+dimension). The backend's validation at launch time is authoritative.
+
+!!! note
+    Backend implementations **must** implement:
+    ```
+    max_num_groups(backend::NewBackend)::NTuple{3, Int}
+    ```
+"""
+function max_num_groups end
+
+"""
     sub_group_size(backend)::Int
 
 Returns a reasonable sub-group size supported by the currently
