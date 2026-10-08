@@ -7,6 +7,7 @@ export DynamicCheck, NoDynamicCheck
 
 import Adapt
 import Base.@pure
+import LLVM
 
 struct DynamicCheck end
 struct NoDynamicCheck end
@@ -17,7 +18,7 @@ axis(r::Base.OneTo) = Int(length(r))
 axis(r::AbstractUnitRange) = UnitRange{Int}(r)
 
 extent(n::Integer) = Int(n)
-extent(r::AbstractUnitRange) = length(r)
+extent(r::AbstractUnitRange) = Int(length(r))
 
 axis_offset(::Integer) = 0
 axis_offset(r::AbstractUnitRange) = first(r) - 1
@@ -30,7 +31,7 @@ a `CartesianIndices`, a single range, or an integer.
 """
 extents(t::Tuple) = map(extent, t)
 extents(ci::CartesianIndices) = size(ci)
-extents(r::AbstractUnitRange) = (length(r),)
+extents(r::AbstractUnitRange) = (extent(r),)
 extents(n::Integer) = (Int(n),)
 
 """
@@ -204,6 +205,16 @@ Base.length(range::NDRange) = length(blocks(range))
     return CartesianIndex(nI)
 end
 
+"""
+    linear_index(iterspace::NDRange, ndrange, groupidx::CartesianIndex, idx::CartesianIndex)
+
+Linear index of work item `idx` of workgroup `groupidx`, as returned by `@index(Global, Linear)`.
+Defaults to the position of `expand(iterspace, groupidx, idx)` within `ndrange`. A custom mapping
+whose linear index is not a function of the expanded index alone, e.g. a list of indices whose
+linear index is the position in the list, can specialize this on its `NDRange` type.
+"""
+@inline linear_index(iterspace::NDRange, ndrange, groupidx::CartesianIndex, idx::CartesianIndex) =
+    linear_index(ndrange, @inbounds expand(iterspace, groupidx, idx))
 
 """
     assume(cond::Bool)
@@ -211,21 +222,7 @@ end
 Assume that the condition `cond` is true. This is a hint to the compiler, possibly enabling
 it to optimize more aggressively.
 """
-@inline assume(cond::Bool) = Base.llvmcall(
-    (
-        """
-        declare void @llvm.assume(i1)
-
-        define void @entry(i8) #0 {
-            %cond = icmp eq i8 %0, 1
-            call void @llvm.assume(i1 %cond)
-            ret void
-        }
-
-        attributes #0 = { alwaysinline }""", "entry",
-    ),
-    Nothing, Tuple{Bool}, cond
-)
+@inline assume(cond::Bool) = LLVM.Interop.assume(cond)
 
 @inline function assume_nonzero(CI::CartesianIndices)
     return ntuple(Val(ndims(CI))) do I

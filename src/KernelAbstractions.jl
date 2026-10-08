@@ -4,8 +4,9 @@ export @kernel
 export @Const, @localmem, @private, @uniform, @synchronize
 export @index, @groupsize, @ndrange
 export @print
-export Backend, GPU, CPU
+export Backend, CPU
 export synchronize, get_backend, allocate
+export foreach_index
 
 import PrecompileTools
 
@@ -14,9 +15,13 @@ import Atomix: @atomic, @atomicswap, @atomicreplace
 using MacroTools
 using Adapt
 
-using KernelInterface: KernelInterface, Backend, GPU, get_backend, functional, synchronize, versioninfo, supports_unified, supports_float64, supports_atomics, copyto!, allocate, zeros, ones, device, device!, ndevices, priority!, pagelock!, unsafe_free!, record_event, wait_event
+using KernelInterface: KernelInterface, Backend, get_backend, functional, synchronize, versioninfo, supports_unified, supports_float64, supports_atomics, copyto!, allocate, zeros, ones, device, device!, ndevices, priority!, pagelock!, unsafe_free!, record_event, wait_event
 import KernelInterface as KI
 export KernelInterface
+
+# `GPU` is deprecated in 0.10:  and backends ends now subtype `Backend` directly. Keep the name working for code written
+# against 0.9, both `x::GPU` and `struct MyBackend <: GPU`.
+Base.@deprecate_binding GPU Backend
 
 """
     @kernel function f(args) end
@@ -70,32 +75,51 @@ synchronize(dev)
 ```
 """
 macro kernel(expr)
-    return __kernel(expr, __source__, #=force_inbounds=# false, #=unsafe_indices=# false)
+    return __kernel(expr, __source__, __module__, #=force_inbounds=# false, #=unsafe_indices=# false, #=generated=# false)
 end
 
 """
     @kernel config function f(args) end
 
-This allows for two different configurations:
+This allows for the following configurations:
 
-1. `cpu={true, false}`: Disables code-generation of the CPU function. This relaxes semantics such that KernelAbstractions primitives can be used in non-kernel functions.
+1. `cpu={true, false}`: **Deprecated** in KernelAbstractions 0.11; this option is ignored.
 2. `inbounds={false, true}`: Enables a forced `@inbounds` macro around the function definition in the case the user is using too many `@inbounds` already in their kernel. Note that this can lead to incorrect results, crashes, etc and is fundamentally unsafe. Be careful!
 3. `unsafe_indices={false, true}`: Disables the implicit validation of indices, users must avoid `@index(Global)`.
+4. `generated={false, true}`: Turns the kernel into a [generated function](https://docs.julialang.org/en/v1/manual/metaprogramming/#Generated-functions), see *Generated* below.
 
 - [`@context`](@ref)
 
 !!! warning
     This is an experimental feature.
 
-!!! note
-    `cpu={true, false}` is deprecated for KernelAbstractions 1.0
+### Generated
+
+With `generated=true` the kernel body is treated as a quoted expression, so `\$` interpolation is
+available and `where`-parameters are bound to their values, e.g. to unroll a loop `\$N` times:
+
+```julia
+@kernel generated = true function kernel_unroll!(a, ::Val{N}) where {N}
+    @unroll \$N for i in 1:5
+        @inbounds a[i] = i * \$N
+    end
+end
+```
+
+This is meant for macros that need a literal, such as `@unroll \$N`, `Base.Cartesian.@nexprs \$N`
+or `@ntuple \$N`; plain `where`-parameters are compile-time constants in every kernel already.
+Configuration parameters must therefore be passed as types (`::Val{N}`) to be usable inside `\$`.
+Inside `\$(...)` the argument names refer to the *types* of the arguments, not their values,
+as in any generated function, and the body cannot contain closures, comprehensions or
+generators (`x -> ...`, `do` blocks, `[f(i) for i in ...]`); use the Cartesian macros above instead.
 """
 macro kernel(ex...)
     if length(ex) == 1
-        return __kernel(ex[1], __source__, false, false)
+        return __kernel(ex[1], __source__, __module__, false, false, false)
     else
         unsafe_indices = false
         force_inbounds = false
+        generated = false
         for i in 1:(length(ex) - 1)
             if ex[i] isa Expr && ex[i].head == :(=) &&
                     ex[i].args[1] == :cpu && ex[i].args[2] isa Bool
@@ -106,17 +130,21 @@ macro kernel(ex...)
             elseif ex[i] isa Expr && ex[i].head == :(=) &&
                     ex[i].args[1] == :unsafe_indices && ex[i].args[2] isa Bool
                 unsafe_indices = ex[i].args[2]
+            elseif ex[i] isa Expr && ex[i].head == :(=) &&
+                    ex[i].args[1] == :generated && ex[i].args[2] isa Bool
+                generated = ex[i].args[2]
             else
                 error(
                     "Configuration should be of form:\n" *
                         "* `cpu=false`\n" *
                         "* `inbounds=true`\n" *
                         "* `unsafe_indices=true`\n" *
+                        "* `generated=true`\n" *
                         "got `", ex[i], "`",
                 )
             end
         end
-        return __kernel(ex[end], __source__, force_inbounds, unsafe_indices)
+        return __kernel(ex[end], __source__, __module__, force_inbounds, unsafe_indices, generated)
     end
 end
 
@@ -185,25 +213,33 @@ end
     @localmem T dims
 
 Declare storage that is local to a workgroup.
+
+Like [`@uniform`](@ref), the allocation is also executed by padding work-items that fall
+outside of the `ndrange`.
 """
 macro localmem(T, dims)
-    # Stay in sync with CUDAnative
+    # one id per call site: a backend that keys workgroup memory on its types
+    # needs it to keep two buffers of the same type and shape apart
     id = gensym("static_shmem")
-
     return :($SharedMemory($(esc(T)), Val($(esc(dims))), Val($(QuoteNode(id)))))
 end
 
 """
     @private T dims
 
-Declare storage that is local to each item in the workgroup. This can be safely used
-across [`@synchronize`](@ref) statements. On a CPU, this will allocate additional implicit
-dimensions to ensure correct localization.
+Declare storage that is private to each work-item. It is preserved across
+[`@synchronize`](@ref) statements.
 
-For storage that only persists between `@synchronize` statements, an `MArray` can be used
-instead.
+This returns a statically sized `StaticArraysCore.StaticArray` (a
+[`KernelAbstractions.PrivateArray`](@ref)) in stack storage, which supports indexing and
+in-place operations on non-overlapping regions. Load StaticArrays for static-array arithmetic,
+slicing and unrolled whole-array reductions. Without it, these fall back to generic
+`AbstractArray` methods: operations that return a new array fail to compile, and reductions
+may spill to local memory or fail to compile, depending on the back-end and size.
 
-See also [`@uniform`](@ref).
+Assignment shares storage, and each `@private` declaration reuses its storage across loop
+iterations. `copy`, `similar` and other operations that allocate are not guaranteed to work,
+and neither is assigning between overlapping views of the same array.
 """
 macro private(T, dims)
     if dims isa Integer
@@ -213,10 +249,10 @@ macro private(T, dims)
 end
 
 """
-    @private mem = 1
+    @private var = expr
 
-Creates a private local of `mem` per item in the workgroup. This can be safely used
-across [`@synchronize`](@ref) statements.
+Equivalent to [`@uniform`](@ref) `var = expr`. Ordinary variables are already private to
+each work-item, and keep their value across [`@synchronize`](@ref) statements.
 """
 macro private(expr)
     return esc(expr)
@@ -225,8 +261,31 @@ end
 """
     @uniform expr
 
-`expr` is evaluated outside the workitem scope. This is useful for variable declarations
-that span workitems, or are reused across `@synchronize` statements.
+Evaluate `expr` on every work-item of the workgroup, including padding work-items that
+fall outside of the `ndrange`. This only applies to `@uniform` statements at the top level
+of the kernel, or directly in control flow that contains a [`@synchronize`](@ref).
+Elsewhere, `@uniform` has no effect.
+
+When the `ndrange` is not a multiple of the workgroup size, `@kernel` only runs the
+kernel body on work-items inside the `ndrange`. Padding work-items do still need to
+reach every [`@synchronize`](@ref), so control flow that contains a `@synchronize`
+runs on all work-items. Values used by such control flow, like the bounds of a loop,
+must therefore be computed with `@uniform`:
+
+```julia
+@kernel function f(A, n)
+    i = @index(Global)
+    @uniform iterations = 2n
+    for j in 1:iterations
+        A[i] += j
+        @synchronize()
+    end
+end
+```
+
+`@uniform` statements are hoisted to the start of the code between two `@synchronize`
+statements. `expr` must be safe to evaluate on padding work-items, so it should not
+depend on the work-item's index.
 """
 macro uniform(value)
     return esc(value)
@@ -239,8 +298,11 @@ After a `@synchronize` statement all read and writes to global and local memory
 from each thread in the workgroup are visible in from all other threads in the
 workgroup.
 
-!!! note
-    `@synchronize()` must be encountered by all workitems of a work-group executing the kernel or by none at all.
+`@synchronize` must be reached by all work-items of a workgroup. To ensure that padding
+work-items outside of the `ndrange` reach it too, `@kernel` treats it specially, so it
+has to appear directly in the kernel body, and not in a function called by the kernel
+(unless the kernel uses `unsafe_indices=true`). Control flow containing it must be
+uniform across the workgroup, see [`@uniform`](@ref).
 """
 macro synchronize()
     return :($__synchronize())
@@ -271,18 +333,16 @@ end
 
 Access the hidden context object used by KernelAbstractions.
 
-!!! warning
-    Only valid to be used from a kernel with `cpu=false`.
+!!! compat "KernelAbstractions 0.10"
+    `@context` is supported on all backends since KernelAbstractions 0.10.
 
-!!! note
-    `@context` will be supported on all backends in KernelAbstractions 1.0
 ```
 function f(@context, a)
     I = @index(Global, Linear)
     a[I]
 end
 
-@kernel cpu=false function my_kernel(a)
+@kernel function my_kernel(a)
     f(@context, a)
 end
 ```
@@ -389,29 +449,16 @@ end
 # Internal kernel functions
 ###
 
-@inline function __index_Local_Linear(ctx)
-    return KI.get_local_id().x
-end
+# The index functions dispatch on the launch configuration of the context (see
+# `launch.jl`). A context without one was launched on a 1-D grid, and is indexed in `Int`.
+@inline index_launch(ctx) = something(__launch(ctx), LinearLaunch{Int}())
 
-@inline function __index_Group_Linear(ctx)
-    return KI.get_group_id().x
-end
-
-@inline function __index_Global_Linear(ctx)
-    I = @inbounds expand(__iterspace(ctx), KI.get_group_id().x, KI.get_local_id().x)
-    # TODO: This is unfortunate, can we get the linear index cheaper
-    return linear_index(__ndrange(ctx), I)
-end
-
-@inline function __index_Local_Cartesian(ctx)
-    return @inbounds workitems(__iterspace(ctx))[KI.get_local_id().x]
-end
-@inline function __index_Group_Cartesian(ctx)
-    return @inbounds blocks(__iterspace(ctx))[KI.get_group_id().x]
-end
-@inline function __index_Global_Cartesian(ctx)
-    return @inbounds expand(__iterspace(ctx), KI.get_group_id().x, KI.get_local_id().x)
-end
+@inline __index_Local_Linear(ctx) = local_linear(ctx, index_launch(ctx))
+@inline __index_Group_Linear(ctx) = group_linear(ctx, index_launch(ctx))
+@inline __index_Global_Linear(ctx) = global_linear(ctx, index_launch(ctx))
+@inline __index_Local_Cartesian(ctx) = local_cartesian(ctx, index_launch(ctx))
+@inline __index_Group_Cartesian(ctx) = group_cartesian(ctx, index_launch(ctx))
+@inline __index_Global_Cartesian(ctx) = global_cartesian(ctx, index_launch(ctx))
 
 @inline __index_Local_NTuple(ctx, I...) = Tuple(__index_Local_Cartesian(ctx, I...))
 @inline __index_Group_NTuple(ctx, I...) = Tuple(__index_Group_Cartesian(ctx, I...))
@@ -449,6 +496,17 @@ Adapt.adapt_storage(::Backend, x)
 
 constify(arg) = adapt(ConstAdaptor(), arg)
 
+# `constify` runs inside the kernel, where wrappers must be rebuilt without re-validating
+# them: Adapt.jl's rules for these wrappers go through constructors whose error paths build
+# strings, which does not compile for GPUs. Adapting only replaces the parent array, so the
+# existing fields remain valid.
+Adapt.adapt_structure(to::ConstAdaptor, A::Base.ReshapedArray) =
+    Base.ReshapedArray(adapt(to, parent(A)), size(A), A.mi)
+@eval function Adapt.adapt_structure(to::ConstAdaptor, A::PermutedDimsArray{T, N, perm, iperm}) where {T, N, perm, iperm}
+    P = adapt(to, parent(A))
+    return $(Expr(:new, :(PermutedDimsArray{eltype(P), N, perm, iperm, typeof(P)}), :P))
+end
+
 include("nditeration.jl")
 using .NDIteration
 import .NDIteration: get
@@ -474,12 +532,8 @@ synchronize(backend)
 Use [`workgroupsize`](@ref KernelAbstractions.workgroupsize), [`ndrange`](@ref KernelAbstractions.ndrange),
 and [`backend`](@ref KernelAbstractions.backend) to inspect a kernel's static configuration.
 
-!!! note
-    Backend implementations **must** implement:
-    ```
-    (kernel::Kernel{<:NewBackend})(args...; ndrange=nothing, workgroupsize=nothing)
-    ```
-    As well as the on-device functionality.
+Kernels are launched on any backend that implements [KernelInterface](@ref kernelinterface);
+see the [notes for backend implementations](@ref implementations_notes).
 """
 struct Kernel{Backend, WorkgroupSize <: _Size, NDRange <: _Size, Fun}
     backend::Backend
@@ -565,13 +619,18 @@ last (possibly partial) workgroup. Primarily used by backend implementations and
     @assert ndrange !== nothing
     blocks, workgroupsize, dynamic = NDIteration.partition(extents(ndrange), workgroupsize)
 
-    if static_ndrange <: StaticSize
+    # the number of blocks is only static if the workgroup size is too: a backend that tunes
+    # the workgroup size would otherwise change the type of the kernel's context
+    if static_ndrange <: StaticSize && static_workgroupsize <: StaticSize
         static_blocks = StaticSize{blocks}
         blocks = nothing
-        mapping = NDIteration.static_mapping(ndrange)
     else
         static_blocks = DynamicSize
         blocks = CartesianIndices(blocks)
+    end
+    if static_ndrange <: StaticSize
+        mapping = NDIteration.static_mapping(ndrange)
+    else
         mapping = NDIteration.dynamic_mapping(ndrange)
     end
 
@@ -586,8 +645,8 @@ last (possibly partial) workgroup. Primarily used by backend implementations and
     return iterspace, dynamic
 end
 
-function construct(backend::Backend, ::S, ::NDRange, xpu_name::XPUName) where {Backend <: GPU, S <: _Size, NDRange <: _Size, XPUName}
-    return Kernel{Backend, S, NDRange, XPUName}(backend, xpu_name)
+function construct(backend::B, ::S, ::NDRange, xpu_name::XPUName) where {B <: Backend, S <: _Size, NDRange <: _Size, XPUName}
+    return Kernel{B, S, NDRange, XPUName}(backend, xpu_name)
 end
 
 ###
@@ -595,33 +654,39 @@ end
 ###
 
 include("compiler.jl")
+include("launch.jl")
 
 ###
 # Compiler/Frontend
 ###
 
 function __workitems_iterspace end
-function __validindex end
 
-# for reflection
-function mkcontext end
-function launch_config end
+# Whether the current work-item is part of the ndrange, or a padding lane of a partial
+# workgroup. Padding lanes still take part in `@synchronize`.
+@inline function __validindex(ctx)
+    if __dynamic_checkbounds(ctx)
+        return validindex(ctx, index_launch(ctx))
+    else
+        return true
+    end
+end
 
 include("macros.jl")
 include("spawn.jl")
+include("foreach_index.jl")
 
 ###
 # Backends/Interface
 ###
 
-function Scratchpad end
+include("private.jl")
 # The `id` is forwarded, not dropped. `@localmem` mints one per call site
 # precisely so that two buffers of the same type and shape are two buffers; a
 # shim that discards it made them one on every backend that answers
 # `KI.localmemory` rather than `KA.SharedMemory` — silently, since the second
 # write simply lands on the first tile.
-SharedMemory(::Type{T}, dims::Val{Dims}, id::Val{Id}) where {T, Dims, Id} =
-    KI.localmemory(T, dims, Id)
+SharedMemory(::Type{T}, dims::Val, id::Val) where {T} = KI.localmemory(T, dims, id)
 
 __synchronize() = KI.barrier()
 
@@ -642,6 +707,8 @@ automatically when a kernel is launched.
 argconvert(k::Kernel{T}, arg) where {T} =
     error("Don't know how to convert arguments for Kernel{$T}")
 
+include("backend_launch.jl")
+
 # Enzyme support
 supports_enzyme(::Backend) = false
 function __fake_compiler_job end
@@ -654,6 +721,28 @@ function __fake_compiler_job end
 include("extras/extras.jl")
 
 include("reflection.jl")
+
+# Expand a kernel in a precompilation workload before this package defines any: code that
+# expanding `@kernel` compiles for the first time outside of a workload isn't cached.
+PrecompileTools.@compile_workload begin
+    macroexpand(
+        @__MODULE__, quote
+            @kernel function precompile_expansion(A, @Const(B))
+                i, j = @index(Local, NTuple)
+                I = @index(Global, Cartesian)
+                n = @uniform @groupsize()[1]
+                tile = @localmem Float32 (16, 16)
+                acc = @private Float32 (1,)
+                @inbounds begin
+                    tile[i, j] = B[I]
+                    @synchronize
+                    acc[1] = tile[j, i]
+                    A[I] = acc[1] * n
+                end
+            end
+        end
+    )
+end
 
 # CPU backend
 include("pocl/pocl.jl")
@@ -684,19 +773,35 @@ A = ones(Float32, 1024)
 mul2_kernel(CPU(), 64)(A, ndrange=length(A))
 synchronize(CPU())
 ```
+
+# Threads
+
+Kernels run on as many threads as Julia's default thread pool has (`julia -t N`), up to the
+number of hardware threads. These are POCL's own threads, so launching a kernel doesn't
+occupy Julia's. To use a different number, set the `JULIA_KA_CPU_THREADS` environment
+variable before the backend is first used, e.g., `JULIA_KA_CPU_THREADS=8 julia -t1`. POCL's
+own variables (e.g., `POCL_CPU_MAX_CU_COUNT`) are respected too, and can also raise the
+number above the number of hardware threads, but they also affect other users of POCL, like
+OpenCL.jl. The device reports the number as its compute units:
+`KernelAbstractions.POCL.device().max_compute_units`.
+
+# Atomics
+
+8- and 16-bit atomic operations (e.g., on `Int8`, `UInt16` or `Float16` arrays) are performed
+on the aligned 32-bit word that contains the value, which must not overlap another allocation
+or memory that is modified independently. For arrays backed by memory that Julia allocated
+(e.g., by [`allocate`](@ref KernelAbstractions.allocate), `Array`, `zeros`, `resize!`,
+`copy` or `similar`), that word stays within the same allocation, because of how Julia's
+allocator is implemented. For arrays that wrap other memory, e.g., with `unsafe_wrap`, this is
+up to the user: make that memory extend to the 4-byte boundaries around the array, e.g., by
+allocating a multiple of 4 bytes at a 4-byte aligned address.
+
+This includes adjacent elements of the same array: while an 8- or 16-bit element is updated
+atomically, the other elements in its aligned 32-bit word must not be modified by plain
+stores concurrently, only atomically.
 """
 const CPU = POCLBackend
 
-# precompile
-PrecompileTools.@compile_workload begin
-    @eval begin
-        @kernel function precompile_kernel(A, @Const(B))
-            i = @index(Global, Linear)
-            lmem = @localmem Float32 (5,)
-            pmem = @private Float32 (1,)
-            @synchronize
-        end
-    end
-end
+include("precompile.jl")
 
 end #module

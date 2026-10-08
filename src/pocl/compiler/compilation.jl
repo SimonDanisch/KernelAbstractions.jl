@@ -20,11 +20,11 @@ session-dependent and wipes its entries before image serialization); `kernels` i
 session-local and never populated during precompilation. `obj === nothing`
 identifies a job that has not been compiled yet.
 
-`kernels` is a small linear cache of `(cl.Context, cl.Kernel)` pairs. The cache partition
-already covers everything that affects codegen via `GPUCompiler.cache_owner`, so the only
-runtime-visible dimension left is the OpenCL context that owns the linked `cl.Kernel`.
-A linear scan with `===` is fastest in the common case (n=1) and stays cheap for the
-rare workload that bounces between a handful of contexts on the same device.
+`kernels` holds the `cl.Kernel` linked on the session's context, paired with that context.
+The cache partition already covers everything that affects codegen via
+`GPUCompiler.cache_owner`, so the only runtime-visible dimension left is the OpenCL context
+that owns the linked `cl.Kernel`. There's one context per session, so this holds at most
+one entry; the context identifies kernels from before a reset of the session.
 """
 mutable struct OpenCLResults
     obj::Union{Nothing, Vector{UInt8}}                   # SPIR-V binary
@@ -36,7 +36,7 @@ end
 
 GPUCompiler.runtime_module(::CompilerJob{<:Any, OpenCLCompilerParams}) = POCL
 
-GPUCompiler.method_table_view(job::OpenCLCompilerJob) = GPUCompiler.StackedMethodTable(job.world, method_table, SPIRVIntrinsics.method_table)
+GPUCompiler.method_tables(::OpenCLCompilerJob) = (method_table, SPIRVIntrinsics.method_table)
 
 # filter out OpenCL built-ins
 # TODO: eagerly lower these using the translator API
@@ -63,49 +63,41 @@ function GPUCompiler.finish_module!(
 
     sg_size = job.config.params.sub_group_size
     if sg_size !== nothing
-        metadata(entry)["intel_reqd_sub_group_size"] = MDNode([ConstantInt(Int32(sg_size))])
+        entry.metadata["intel_reqd_sub_group_size"] = MDNode([ConstantInt(Int32(sg_size))])
     end
 
     # if this kernel uses our RNG, we should prime the shared state.
     # XXX: these transformations should really happen at the Julia IR level...
-    if haskey(functions(mod), "julia.opencl.random_keys") && job.config.kernel
+    if haskey(mod.functions, "julia.opencl.random_keys") && job.config.kernel
         # insert call to `initialize_rng_state`
         f = initialize_rng_state
         ft = typeof(f)
         tt = Tuple{}
 
         # create a deferred compilation job for `initialize_rng_state`
-        src = methodinstance(ft, tt, GPUCompiler.tls_world_age())
+        src = methodinstance(ft, tt, job.world)
         cfg = CompilerConfig(job.config; kernel = false, name = nothing)
         job = CompilerJob(src, cfg, job.world)
         id = length(GPUCompiler.deferred_codegen_jobs) + 1
         GPUCompiler.deferred_codegen_jobs[id] = job
 
         # generate IR for calls to `deferred_codegen` and the resulting function pointer
-        top_bb = first(blocks(entry))
-        bb = BasicBlock(top_bb, "initialize_rng")
+        top_bb = entry.entry
+        bb = BasicBlock(LLVM.before(top_bb), "initialize_rng")
         @dispose builder = IRBuilder() begin
-            position!(builder, bb)
-            subprogram = LLVM.subprogram(entry)
+            position!(builder, LLVM.at_end(bb))
+            subprogram = entry.subprogram
             if subprogram !== nothing
                 loc = DILocation(0, 0, subprogram)
-                debuglocation!(builder, loc)
+                builder.debug_location = loc
             end
-            debuglocation!(builder, first(instructions(top_bb)))
 
             # call the `deferred_codegen` marker function
-            T_ptr = if LLVM.version() >= v"17"
-                LLVM.PointerType()
-            elseif VERSION >= v"1.12.0-DEV.225"
-                LLVM.PointerType(LLVM.Int8Type())
-            else
-                LLVM.Int64Type()
-            end
+            # (declared like GPUCompiler's `ccall("extern deferred_codegen", llvmcall, Ptr{Cvoid}, ...)`)
+            T_ptr = convert(LLVMType, Ptr{Cvoid})
             T_id = convert(LLVMType, Int)
             deferred_codegen_ft = LLVM.FunctionType(T_ptr, [T_id])
-            deferred_codegen = if haskey(functions(mod), "deferred_codegen")
-                functions(mod)["deferred_codegen"]
-            else
+            deferred_codegen = get!(mod.functions, "deferred_codegen") do
                 LLVM.Function(mod, "deferred_codegen", deferred_codegen_ft)
             end
             fptr = call!(builder, deferred_codegen_ft, deferred_codegen, [ConstantInt(id)])
@@ -119,7 +111,7 @@ function GPUCompiler.finish_module!(
             br!(builder, top_bb)
 
             # note the use of the device-side RNG in this kernel
-            push!(function_attributes(entry), StringAttribute("julia.opencl.rng", ""))
+            push!(entry.function_attributes, StringAttribute("julia.opencl.rng", ""))
         end
 
         # XXX: put some of the above behind GPUCompiler abstractions
@@ -143,64 +135,71 @@ end
 ## compiler implementation (configure, compile, and link)
 
 """
-    supports_fp_atomics(caps::UInt64, ops::UInt64)
+    spirv_atomics(dev)
 
-Whether the `cl_ext_float_atomics` capability bitfield `caps` (see
-`dev.single_fp_atomic_capabilities` and friends) natively supports all of `ops`.
-Kernels perform atomics on both global and local memory, so callers should
-require both the `GLOBAL` and `LOCAL` bit of an operation.
+The atomic operations `dev` supports, for which `SPIRVCompilerTarget` selects SPIR-V
+instructions instead of compare-and-swap loops.
+
+Floating-point addition is supported per precision and address space as `dev` reports it
+through `cl_ext_float_atomics`, for half and double precision only if `dev` supports those
+types. 64-bit integer atomics need both `cl_khr_int64_base_atomics` and
+`cl_khr_int64_extended_atomics`.
 """
-supports_fp_atomics(caps::UInt64, ops::UInt64) = caps & ops == ops
-
-const fp_atomic_add = cl.CL_DEVICE_GLOBAL_FP_ATOMIC_ADD_EXT | cl.CL_DEVICE_LOCAL_FP_ATOMIC_ADD_EXT
-const fp_atomic_min_max = cl.CL_DEVICE_GLOBAL_FP_ATOMIC_MIN_MAX_EXT | cl.CL_DEVICE_LOCAL_FP_ATOMIC_MIN_MAX_EXT
-
-"""
-    default_spirv_extensions(dev)
-
-SPIR-V extensions to permit for `dev`, as the `+`-prefixed, comma-separated string
-`SPIRVCompilerTarget` passes on to the backend via `-spirv-ext`.
-
-Listing an extension only *permits* it: nothing is emitted unless a module actually
-needs the instructions it guards, so this costs nothing for kernels that don't.
-"""
-function default_spirv_extensions(dev)
-    exts = String[]
-
-    # Floating-point atomics. Atomix/UnsafeAtomics lower `@atomic A[i] += x` and
-    # `@atomic max(A[i], x)` on floats to LLVM `atomicrmw fadd`/`fmin`/`fmax`, which the
-    # SPIR-V backend only translates when the corresponding extension is permitted:
-    #   LLVM ERROR: The atomic float instruction requires the following SPIR-V
-    #   extension: SPV_EXT_shader_atomic_float_add
-    # Enzyme's reverse mode hits this too, as it accumulates gradients with atomic fadd.
-    # The device reports native support per precision through cl_ext_float_atomics.
-    fp32 = dev.single_fp_atomic_capabilities
-    fp64 = dev.double_fp_atomic_capabilities
-    if supports_fp_atomics(fp32, fp_atomic_add) || supports_fp_atomics(fp64, fp_atomic_add)
-        push!(exts, "+SPV_EXT_shader_atomic_float_add")
-    end
-    if supports_fp_atomics(fp32, fp_atomic_min_max) || supports_fp_atomics(fp64, fp_atomic_min_max)
-        push!(exts, "+SPV_EXT_shader_atomic_float_min_max")
-    end
-
-    return join(exts, ",")
+function spirv_atomics(dev)
+    exts = dev.extensions
+    f16 = "cl_khr_fp16" in exts ? dev.half_fp_atomic_capabilities : zero(UInt64)
+    f32 = dev.single_fp_atomic_capabilities
+    f64 = "cl_khr_fp64" in exts ? dev.double_fp_atomic_capabilities : zero(UInt64)
+    global_add(caps) = caps & cl.CL_DEVICE_GLOBAL_FP_ATOMIC_ADD_EXT != 0
+    local_add(caps) = caps & cl.CL_DEVICE_LOCAL_FP_ATOMIC_ADD_EXT != 0
+    return SPIRVAtomics(;
+        int64 = "cl_khr_int64_base_atomics" in exts && "cl_khr_int64_extended_atomics" in exts,
+        fadd_f16_global = global_add(f16), fadd_f16_local = local_add(f16),
+        fadd_f32_global = global_add(f32), fadd_f32_local = local_add(f32),
+        fadd_f64_global = global_add(f64), fadd_f64_local = local_add(f64),
+    )
 end
+
+"""
+    compiler_config(dev; kwargs...)
+
+The GPUCompiler configuration for compiling kernels for `dev`, cached per device and
+keyword arguments. Besides those of `CompilerConfig` (`kernel`, `name`, `always_inline`,
+`debug_level`) and `sub_group_size`, it takes:
+
+- `atomics`: override the atomic capabilities GPUCompiler may select directly. This
+  replaces the whole device-derived `SPIRVAtomics` (see `spirv_atomics`), and defaults to
+  the device's capabilities. Enabling capabilities the device doesn't support can make
+  compilation fail or crash the driver's compiler, while disabling them relies on integer
+  compare-and-swap for the fallback.
+- `extensions`: SPIR-V extensions to enable, as a `--spirv-ext` specifier (e.g.
+  `"+SPV_KHR_expect_assume"`), in addition to those the atomics need. `nothing`, the
+  default, enables no others.
+
+Other keyword arguments are passed on to `SPIRVCompilerTarget`.
+"""
+function compiler_config end
 
 # cache of compiler configurations, per device (but additionally configurable via kwargs)
 const _toolchain = Ref{Any}()
 const _compiler_configs = Dict{UInt, OpenCLCompilerConfig}()
 function compiler_config(dev::cl.Device; kwargs...)
     h = hash(dev, hash(kwargs))
-    config = get(_compiler_configs, h, nothing)
-    if config === nothing
-        config = _compiler_config(dev; kwargs...)
-        _compiler_configs[h] = config
+    # launches already hold this (reentrant) lock, but reflection doesn't
+    return @lock clfunction_lock begin
+        config = get(_compiler_configs, h, nothing)
+        if config === nothing
+            config = _compiler_config(dev; kwargs...)
+            _compiler_configs[h] = config
+        end
+        config
     end
-    return config
 end
 @noinline function _compiler_config(
         dev; kernel = true, name = nothing, always_inline = false,
+        debug_level = Base.JLOptions().debug_level,
         sub_group_size::Union{Nothing, Int} = 32,
+        atomics::SPIRVAtomics = spirv_atomics(dev),
         extensions::Union{Nothing, String} = nothing, kwargs...
     )
     supports_fp16 = "cl_khr_fp16" in dev.extensions
@@ -210,15 +209,25 @@ end
         error("$sub_group_size is not a valid sub-group size for this device.")
     end
 
-    if extensions === nothing
-        extensions = default_spirv_extensions(dev)
-    end
-
     # create GPUCompiler objects
-    target = SPIRVCompilerTarget(; supports_fp16, supports_fp64, extensions, validate = true, kwargs...)
+    target = SPIRVCompilerTarget(;
+        supports_fp16, supports_fp64, atomics, extensions = something(extensions, ""),
+        validate = true, kwargs...
+    )
     params = OpenCLCompilerParams(; sub_group_size)
-    return CompilerConfig(target, params; kernel, name, always_inline)
+    return CompilerConfig(target, params; kernel, name, always_inline, debug_level)
 end
+
+# The world in which this package was loaded. Running the compiler in that world reuses the
+# native code that precompilation generated for it, even when packages loaded afterwards
+# invalidate some of it (e.g. by adding methods to Base functions the compiler calls).
+# Kernels themselves are still compiled for the current world (`job.world`), but methods of
+# the compiler's interface (e.g. `GPUCompiler.finish_module!`) that are added after loading,
+# for example by Revise, aren't used. Before `__init__` runs, as during precompilation,
+# `invoke_in_world` clamps the world to the current one.
+const initialization_world = Ref{UInt}(typemax(UInt))
+
+invoke_frozen(f, args...) = Base.invoke_in_world(initialization_world[], f, args...)
 
 # run inference + LLVM codegen + SPIR-V emission. returns `(obj, entry, device_rng)`,
 # all session-portable so they survive precompilation when stored on a cached `CodeInstance`.
@@ -227,12 +236,14 @@ function compile_to_obj(@nospecialize(job::CompilerJob))
     compilations[] += 1
 
     return JuliaContext() do ctx
-        obj, meta = GPUCompiler.compile(:obj, job)
+        obj, meta = invoke_frozen(GPUCompiler.compile, :obj, job)
 
-        entry = LLVM.name(meta.entry)
-        device_rng = StringAttribute("julia.opencl.rng", "") in collect(function_attributes(meta.entry))
-
-        (; obj, entry, device_rng)
+        # we own the IR: inspect it, then dispose of it
+        @dispose ir = meta.ir begin
+            entry = meta.entry.name
+            device_rng = haskey(meta.entry.function_attributes, "julia.opencl.rng")
+            (; obj, entry, device_rng)
+        end
     end
 end
 

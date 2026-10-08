@@ -33,7 +33,6 @@
 
 ```@docs
 Backend
-GPU
 CPU
 POCLBackend
 get_backend
@@ -73,6 +72,12 @@ KernelAbstractions.ndrange
 KernelAbstractions.backend
 ```
 
+### Index loops
+
+```@docs
+foreach_index
+```
+
 ## Reflection
 
 To look at the code a backend actually generates, wrap a kernel launch in one of the
@@ -109,4 +114,10 @@ KernelAbstractions.NDIteration.DynamicOffset
 KernelAbstractions.NDIteration.extents
 KernelAbstractions.NDIteration.offsets
 KernelAbstractions.NDIteration.linear_index
+KernelAbstractions.LinearLaunch
+KernelAbstractions.NDLaunch
+KernelAbstractions.select_launch
+KernelAbstractions.launch_workgroupsize
+KernelAbstractions.compiler_options
+KernelAbstractions.PrivateArray
 ```

@@ -16,6 +16,7 @@
 using FileCheck
 using KernelAbstractions
 using KernelAbstractions: @atomic
+using StaticArrays
 using Test
 
 import KernelAbstractions.POCL: @device_code_llvm
@@ -52,6 +53,31 @@ end
     @print("index ", I, "\n")
 end
 
+@kernel function codegen_private_reduce(A)
+    I = @index(Global, Linear)
+    priv = @private Float32 (8,)
+    for j in 1:8
+        @inbounds priv[j] = A[I] * j
+    end
+    @inbounds A[I] = sum(priv) + maximum(priv) + foldl(-, priv)
+end
+
+@noinline private_consume(priv) = @inbounds priv[1] + priv[8]
+
+@kernel function codegen_private_escape(A)
+    I = @index(Global, Linear)
+    priv = @private Float32 (8,)
+    for j in 1:8
+        @inbounds priv[j] = A[I] * j
+    end
+    @inbounds A[I] = private_consume(priv)
+end
+
+@kernel function codegen_global_linear(A)
+    I = @index(Global, Linear)
+    @inbounds A[I] = I
+end
+
 # `@inbounds` is only honoured under `--check-bounds=auto`; several checks below assert
 # that it removes code, so refuse to run under anything else rather than fail obscurely.
 if Base.JLOptions().check_bounds != 0
@@ -68,8 +94,8 @@ end
     @testset "index computation" begin
         @test @filecheck implicit_check_not = "jl_" begin
             @check "define spir_kernel void @{{.*}}gpu_codegen_mul2_inbounds"
-            @check "@__spirv_BuiltInWorkgroupId"
-            @check "@__spirv_BuiltInLocalInvocationId"
+            @check "__spirv_BuiltInWorkgroupId"
+            @check "__spirv_BuiltInLocalInvocationId"
             @check "load float, {{.*}}addrspace(1)"
             @check "store float {{.*}}addrspace(1)"
             @check "ret void"
@@ -141,13 +167,57 @@ end
         end
     end
 
-    # `@atomic` lowers to a native atomicrmw on global memory rather than to a lock or a
-    # compare-and-swap loop.
+    # `@atomic` lowers to a native floating-point addition on global memory, which PoCL
+    # supports, rather than to a lock or a compare-and-swap loop.
     @testset "atomics" begin
-        @test @filecheck implicit_check_not = "cmpxchg" begin
+        @test @filecheck implicit_check_not = "{{cmpxchg|AtomicCompareExchange}}" begin
             @check "define spir_kernel void @{{.*}}gpu_codegen_atomic_sum"
-            @check "atomicrmw fadd"
+            @check "call float @{{.*}}__spirv_AtomicFAddEXT"
             @device_code_llvm debuginfo = :none codegen_atomic_sum(backend, 16)(A, out, ndrange = 64)
+            KernelAbstractions.synchronize(backend)
+        end
+    end
+
+    # An N-d launch maps the work-item builtins onto a dynamic 3-D iteration space directly,
+    # without decomposing linear ids.
+    @testset "N-d launch" begin
+        B = KernelAbstractions.zeros(backend, Int, 4, 5, 6)
+        @test @filecheck implicit_check_not = "{{[us]div i(32|64)}}" begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_global_linear"
+            @check "ret void"
+            @device_code_llvm debuginfo = :none codegen_global_linear(backend)(B, ndrange = size(B))
+            KernelAbstractions.synchronize(backend)
+        end
+
+        # a linear launch does, so the test above is not vacuous
+        kernel = codegen_global_linear(backend)
+        ndrange, workgroupsize, iterspace, _ = KernelAbstractions.launch_config(kernel, size(B), nothing)
+        @test @filecheck begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_global_linear"
+            @check "udiv i32"
+            @device_code_llvm debuginfo = :none KernelAbstractions.launch_kernel(
+                kernel, KernelAbstractions.LinearLaunch{Int32}(), ndrange, workgroupsize, iterspace, (B,)
+            )
+            KernelAbstractions.synchronize(backend)
+        end
+    end
+
+    # With StaticArrays loaded, whole-array reductions over `@private` storage are unrolled,
+    # so the stack slot is promoted to registers rather than read through memory.
+    @testset "private" begin
+        @test @filecheck implicit_check_not = "alloca" begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_private_reduce"
+            @check "ret void"
+            @device_code_llvm debuginfo = :none codegen_private_reduce(backend, 16)(A, ndrange = 64)
+            KernelAbstractions.synchronize(backend)
+        end
+
+        # storage passed to a function that isn't inlined stays on the stack, so the test
+        # above is not vacuous
+        @test @filecheck begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_private_escape"
+            @check "alloca"
+            @device_code_llvm debuginfo = :none codegen_private_escape(backend, 16)(A, ndrange = 64)
             KernelAbstractions.synchronize(backend)
         end
     end

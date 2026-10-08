@@ -4,6 +4,8 @@ using ..POCL: platform, device, context, queue
 
 import pocl_standalone_jll
 
+using GPUToolbox: GPUToolbox, @gcsafe_ccall, cooperative_wait
+
 using Printf
 
 const libopencl = pocl_standalone_jll.libpocl
@@ -236,6 +238,10 @@ const CL_DEVICE_PARTITION_PROPERTIES = 0x1044
 const CL_DEVICE_PARTITION_AFFINITY_DOMAIN = 0x1045
 
 const CL_DEVICE_PARTITION_TYPE = 0x1046
+
+const CL_DEVICE_PARTITION_BY_COUNTS = 0x1087
+
+const CL_DEVICE_PARTITION_BY_COUNTS_LIST_END = 0x00
 
 const CL_DEVICE_REFERENCE_COUNT = 0x1047
 
@@ -482,6 +488,8 @@ const cl_device_info = cl_uint
 
 const cl_context_properties = intptr_t
 
+const cl_device_partition_property = intptr_t
+
 const cl_context_info = cl_uint
 
 const cl_build_status = cl_int
@@ -511,7 +519,7 @@ const cl_command_queue_properties = cl_bitfield
 const cl_event_info = cl_uint
 
 @checked function clGetPlatformIDs(num_entries, platforms, num_platforms)
-    @ccall libopencl.POclGetPlatformIDs(
+    @gcsafe_ccall libopencl.POclGetPlatformIDs(
         num_entries::cl_uint, platforms::Ptr{cl_platform_id},
         num_platforms::Ptr{cl_uint}
     )::cl_int
@@ -521,7 +529,7 @@ end
         platform, param_name, param_value_size, param_value,
         param_value_size_ret
     )
-    @ccall libopencl.POclGetPlatformInfo(
+    @gcsafe_ccall libopencl.POclGetPlatformInfo(
         platform::cl_platform_id,
         param_name::cl_platform_info,
         param_value_size::Csize_t, param_value::Ptr{Cvoid},
@@ -530,10 +538,20 @@ end
 end
 
 @checked function clGetDeviceIDs(platform, device_type, num_entries, devices, num_devices)
-    @ccall libopencl.POclGetDeviceIDs(
+    @gcsafe_ccall libopencl.POclGetDeviceIDs(
         platform::cl_platform_id, device_type::cl_device_type,
         num_entries::cl_uint, devices::Ptr{cl_device_id},
         num_devices::Ptr{cl_uint}
+    )::cl_int
+end
+
+@checked function clCreateSubDevices(
+        in_device, properties, num_devices, out_devices, num_devices_ret
+    )
+    @gcsafe_ccall libopencl.POclCreateSubDevices(
+        in_device::cl_device_id, properties::Ptr{cl_device_partition_property},
+        num_devices::cl_uint, out_devices::Ptr{cl_device_id},
+        num_devices_ret::Ptr{cl_uint}
     )::cl_int
 end
 
@@ -541,7 +559,7 @@ end
         device, param_name, param_value_size, param_value,
         param_value_size_ret
     )
-    @ccall libopencl.POclGetDeviceInfo(
+    @gcsafe_ccall libopencl.POclGetDeviceInfo(
         device::cl_device_id, param_name::cl_device_info,
         param_value_size::Csize_t, param_value::Ptr{Cvoid},
         param_value_size_ret::Ptr{Csize_t}
@@ -552,7 +570,7 @@ function clCreateContext(
         properties, num_devices, devices, pfn_notify, user_data,
         errcode_ret
     )
-    return @ccall libopencl.POclCreateContext(
+    return @gcsafe_ccall libopencl.POclCreateContext(
         properties::Ptr{cl_context_properties},
         num_devices::cl_uint, devices::Ptr{cl_device_id},
         pfn_notify::Ptr{Cvoid}, user_data::Ptr{Cvoid},
@@ -561,11 +579,11 @@ function clCreateContext(
 end
 
 @checked function clReleaseContext(context)
-    @ccall libopencl.POclReleaseContext(context::cl_context)::cl_int
+    @gcsafe_ccall libopencl.POclReleaseContext(context::cl_context)::cl_int
 end
 
 function clCreateProgramWithIL(context, il, length, errcode_ret)
-    return @ccall libopencl.POclCreateProgramWithIL(
+    return @gcsafe_ccall libopencl.POclCreateProgramWithIL(
         context::cl_context, il::Ptr{Cvoid},
         length::Csize_t,
         errcode_ret::Ptr{cl_int}
@@ -573,14 +591,14 @@ function clCreateProgramWithIL(context, il, length, errcode_ret)
 end
 
 @checked function clReleaseProgram(program)
-    @ccall libopencl.POclReleaseProgram(program::cl_program)::cl_int
+    @gcsafe_ccall libopencl.POclReleaseProgram(program::cl_program)::cl_int
 end
 
 @checked function clBuildProgram(
         program, num_devices, device_list, options, pfn_notify,
         user_data
     )
-    @ccall libopencl.POclBuildProgram(
+    @gcsafe_ccall libopencl.POclBuildProgram(
         program::cl_program, num_devices::cl_uint,
         device_list::Ptr{cl_device_id}, options::Ptr{Cchar},
         pfn_notify::Ptr{Cvoid}, user_data::Ptr{Cvoid}
@@ -591,7 +609,7 @@ end
         program, param_name, param_value_size, param_value,
         param_value_size_ret
     )
-    @ccall libopencl.POclGetProgramInfo(
+    @gcsafe_ccall libopencl.POclGetProgramInfo(
         program::cl_program, param_name::cl_program_info,
         param_value_size::Csize_t, param_value::Ptr{Cvoid},
         param_value_size_ret::Ptr{Csize_t}
@@ -602,7 +620,7 @@ end
         program, device, param_name, param_value_size,
         param_value, param_value_size_ret
     )
-    @ccall libopencl.POclGetProgramBuildInfo(
+    @gcsafe_ccall libopencl.POclGetProgramBuildInfo(
         program::cl_program, device::cl_device_id,
         param_name::cl_program_build_info,
         param_value_size::Csize_t,
@@ -612,25 +630,25 @@ end
 end
 
 function clCreateKernel(program, kernel_name, errcode_ret)
-    return @ccall libopencl.POclCreateKernel(
+    return @gcsafe_ccall libopencl.POclCreateKernel(
         program::cl_program, kernel_name::Ptr{Cchar},
         errcode_ret::Ptr{cl_int}
     )::cl_kernel
 end
 
 @checked function clReleaseKernel(kernel)
-    @ccall libopencl.POclReleaseKernel(kernel::cl_kernel)::cl_int
+    @gcsafe_ccall libopencl.POclReleaseKernel(kernel::cl_kernel)::cl_int
 end
 
 @checked function clSetKernelArg(kernel, arg_index, arg_size, arg_value)
-    @ccall libopencl.POclSetKernelArg(
+    @gcsafe_ccall libopencl.POclSetKernelArg(
         kernel::cl_kernel, arg_index::cl_uint,
         arg_size::Csize_t, arg_value::Ptr{Cvoid}
     )::cl_int
 end
 
 @checked function clSetKernelArgSVMPointer(kernel, arg_index, arg_value)
-    @ccall libopencl.POclSetKernelArgSVMPointer(
+    @gcsafe_ccall libopencl.POclSetKernelArgSVMPointer(
         kernel::cl_kernel, arg_index::cl_uint,
         arg_value::Ptr{Cvoid}
     )::cl_int
@@ -640,7 +658,7 @@ end
         kernel, device, param_name, param_value_size,
         param_value, param_value_size_ret
     )
-    @ccall libopencl.POclGetKernelWorkGroupInfo(
+    @gcsafe_ccall libopencl.POclGetKernelWorkGroupInfo(
         kernel::cl_kernel, device::cl_device_id,
         param_name::cl_kernel_work_group_info,
         param_value_size::Csize_t,
@@ -654,7 +672,7 @@ end
         input_value, param_value_size, param_value,
         param_value_size_ret
     )
-    @ccall libopencl.POclGetKernelSubGroupInfo(
+    @gcsafe_ccall libopencl.POclGetKernelSubGroupInfo(
         kernel::cl_kernel, device::cl_device_id,
         param_name::cl_kernel_sub_group_info,
         input_value_size::Csize_t,
@@ -670,7 +688,7 @@ end
         command_queue, kernel, work_dim,
         global_work_size::NTuple{3, Csize_t}, local_work_size::NTuple{3, Csize_t}, event::Ref{cl_event}
     )
-    @ccall libopencl.POclEnqueueNDRangeKernel(
+    @gcsafe_ccall libopencl.POclEnqueueNDRangeKernel(
         command_queue::cl_command_queue,
         kernel::cl_kernel, work_dim::cl_uint,
         C_NULL::Ptr{Csize_t},
@@ -688,7 +706,7 @@ end
         local_work_size, num_events_in_wait_list,
         event_wait_list, event
     )
-    @ccall libopencl.POclEnqueueNDRangeKernel(
+    @gcsafe_ccall libopencl.POclEnqueueNDRangeKernel(
         command_queue::cl_command_queue,
         kernel::cl_kernel, work_dim::cl_uint,
         global_work_offset::Ptr{Csize_t},
@@ -701,7 +719,7 @@ end
 end
 
 function clCreateCommandQueue(context, device, properties, errcode_ret)
-    return @ccall libopencl.POclCreateCommandQueue(
+    return @gcsafe_ccall libopencl.POclCreateCommandQueue(
         context::cl_context, device::cl_device_id,
         properties::cl_command_queue_properties,
         errcode_ret::Ptr{cl_int}
@@ -709,22 +727,33 @@ function clCreateCommandQueue(context, device, properties, errcode_ret)
 end
 
 @checked function clReleaseCommandQueue(command_queue)
-    @ccall libopencl.POclReleaseCommandQueue(command_queue::cl_command_queue)::cl_int
+    @gcsafe_ccall libopencl.POclReleaseCommandQueue(command_queue::cl_command_queue)::cl_int
 end
 
 @checked function clFinish(command_queue)
-    @ccall libopencl.POclFinish(command_queue::cl_command_queue)::cl_int
+    @gcsafe_ccall libopencl.POclFinish(command_queue::cl_command_queue)::cl_int
+end
+
+@checked function clFlush(command_queue)
+    @gcsafe_ccall libopencl.POclFlush(command_queue::cl_command_queue)::cl_int
+end
+
+@checked function clSetEventCallback(event, command_exec_callback_type, pfn_notify, user_data)
+    @gcsafe_ccall libopencl.POclSetEventCallback(
+        event::cl_event, command_exec_callback_type::cl_int,
+        pfn_notify::Ptr{Cvoid}, user_data::Ptr{Cvoid}
+    )::cl_int
 end
 
 @checked function clWaitForEvents(num_events, event_list)
-    @ccall libopencl.POclWaitForEvents(num_events::cl_uint, event_list::Ptr{cl_event})::cl_int
+    @gcsafe_ccall libopencl.POclWaitForEvents(num_events::cl_uint, event_list::Ptr{cl_event})::cl_int
 end
 
 @checked function clGetEventInfo(
         event, param_name, param_value_size, param_value,
         param_value_size_ret
     )
-    @ccall libopencl.POclGetEventInfo(
+    @gcsafe_ccall libopencl.POclGetEventInfo(
         event::cl_event, param_name::cl_event_info,
         param_value_size::Csize_t, param_value::Ptr{Cvoid},
         param_value_size_ret::Ptr{Csize_t}
@@ -732,7 +761,7 @@ end
 end
 
 @checked function clReleaseEvent(event)
-    @ccall libopencl.POclReleaseEvent(event::cl_event)::cl_int
+    @gcsafe_ccall libopencl.POclReleaseEvent(event::cl_event)::cl_int
 end
 
 # Init
@@ -741,35 +770,26 @@ end
 const initialized = Ref{Bool}(false)
 @noinline function initialize()
     initialized[] = true
-    return nothing
+    return
+end
 
-    # @static if Sys.iswindows()
-    #     if is_high_integrity_level()
-    #         @warn """Running at high integrity level, preventing OpenCL.jl from loading drivers from JLLs.
-
-    #         Only system drivers will be available. To enable JLL drivers, do not run Julia as an administrator."""
-    #     end
-    # end
-
-    # ocd_filenames = join(OpenCL_jll.drivers, ':')
-    # if haskey(ENV, "OCL_ICD_FILENAMES")
-    #     ocd_filenames *= ":" * ENV["OCL_ICD_FILENAMES"]
-    # end
-
-    # return withenv("OCL_ICD_FILENAMES" => ocd_filenames) do
-    #     num_platforms = Ref{Cuint}()
-    #     @ccall libopencl.POclGetPlatformIDs(
-    #         0::cl_uint, C_NULL::Ptr{cl_platform_id},
-    #         num_platforms::Ptr{cl_uint}
-    #     )::cl_int
-
-    #     if num_platforms[] == 0 && isempty(OpenCL_jll.drivers)
-    #         @error """No OpenCL drivers available, either system-wide or provided by a JLL.
-
-    #         Please install a system-wide OpenCL driver, or load one together with OpenCL.jl,
-    #         e.g., by doing `using OpenCL, pocl_jll`."""
-    #     end
-    # end
+# by default, PoCL's CPU device runs kernels on every hardware thread. that oversubscribes
+# the CPU when Julia uses several processes (e.g., with MPI), so default to as many threads
+# as Julia has, unless PoCL has been configured with its own environment variables.
+# returns `nothing` to use the whole device.
+const pocl_thread_variables =
+    ("POCL_MAX_PTHREAD_COUNT", "POCL_CPU_MAX_CU_COUNT", "POCL_MAX_COMPUTE_UNITS")
+function cpu_threads()
+    str = get(ENV, "JULIA_KA_CPU_THREADS", nothing)
+    if str !== nothing
+        threads = tryparse(Int, str)
+        if threads === nothing || !(1 <= threads <= typemax(Cint))
+            error("Invalid value for JULIA_KA_CPU_THREADS: $(repr(str)); expected a positive integer")
+        end
+        return threads
+    end
+    any(var -> haskey(ENV, var), pocl_thread_variables) && return nothing
+    return Threads.nthreads(:default)
 end
 
 # Julia API
@@ -865,6 +885,17 @@ end
 
 devices(p::Platform) = devices(p, CL_DEVICE_TYPE_ALL)
 
+# a sub-device that runs commands on `compute_units` of the device's compute units
+function sub_device(d::Device, compute_units::Integer)
+    properties = cl_device_partition_property[
+        CL_DEVICE_PARTITION_BY_COUNTS, compute_units,
+        CL_DEVICE_PARTITION_BY_COUNTS_LIST_END, 0,
+    ]
+    sub = Ref{cl_device_id}()
+    clCreateSubDevices(d, properties, 1, sub, C_NULL)
+    return Device(sub[])
+end
+
 @inline function Base.getproperty(d::Device, s::Symbol)
     # simple string properties
     version_re = r"OpenCL (?<major>\d+)\.(?<minor>\d+)(?<vendor>.+)"
@@ -907,6 +938,8 @@ devices(p::Platform) = devices(p, CL_DEVICE_TYPE_ALL)
         return get_scalar(CL_DEVICE_VENDOR_ID, cl_uint)
     elseif s === :max_compute_units
         return get_scalar(CL_DEVICE_MAX_COMPUTE_UNITS, cl_uint)
+    elseif s === :max_sub_devices
+        return get_scalar(CL_DEVICE_PARTITION_MAX_SUB_DEVICES, cl_uint)
     elseif s === :max_work_item_dims
         return get_scalar(CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS, cl_uint)
     elseif s === :max_clock_frequency
@@ -1188,9 +1221,11 @@ end
 
 mutable struct Kernel
     const id::cl_kernel
+    # kernel arguments are state of the kernel object, see `call`
+    const lock::ReentrantLock
 
     function Kernel(k::cl_kernel)
-        kernel = new(k)
+        kernel = new(k, ReentrantLock())
         finalizer(clReleaseKernel, kernel)
         return kernel
     end
@@ -1247,13 +1282,18 @@ end
 ## when passing with `clcall`, which has pre-converted the buffer
 function set_arg!(k::Kernel, idx::Integer, arg::Union{Ptr, Core.LLVMPtr})
     arg = reinterpret(Ptr{Cvoid}, arg)
-    if arg != C_NULL
-        # XXX: this assumes that the receiving argument is pointer-typed, which is not the
-        #      case with Julia's `Ptr` ABI. Instead, one should reinterpret the pointer as a
-        #      `Core.LLVMPtr`, which _is_ pointer-valued. We retain this handling for `Ptr`
-        #      for users passing pointers to OpenCL C, and because `Ptr` is pointer-valued
-        #      starting with Julia 1.12.
-        clSetKernelArgSVMPointer(k, cl_uint(idx - 1), arg)
+    # XXX: this assumes that the receiving argument is pointer-typed, which is not the
+    #      case with Julia's `Ptr` ABI. Instead, one should reinterpret the pointer as a
+    #      `Core.LLVMPtr`, which _is_ pointer-valued. We retain this handling for `Ptr`
+    #      for users passing pointers to OpenCL C, and because `Ptr` is pointer-valued
+    #      starting with Julia 1.12.
+    err = unchecked_clSetKernelArgSVMPointer(k, cl_uint(idx - 1), arg)
+    if err == CL_INVALID_ARG_INDEX && arg == C_NULL
+        # before Julia 1.12, a `Ptr` argument is an integer. null pointers still have to be
+        # set, or the kernel would see an argument from an earlier launch.
+        set_arg!(k, idx, UInt(0))
+    elseif err != CL_SUCCESS
+        throw(CLError(err))
     end
     return k
 end
@@ -1272,7 +1312,7 @@ end
 
 function set_arg!(k::Kernel, idx::Integer, arg::T) where {T}
     # `Ref{T}` makes `ccall` pass a pointer to a stack copy of `arg`
-    err = @ccall libopencl.POclSetKernelArg(
+    err = @gcsafe_ccall libopencl.POclSetKernelArg(
         k::cl_kernel, cl_uint(idx - 1)::cl_uint, sizeof(T)::Csize_t, arg::Ref{T}
     )::cl_int
     if err == CL_INVALID_ARG_SIZE
@@ -1293,11 +1333,10 @@ function set_arg!(k::Kernel, idx::Integer, arg::T) where {T}
     return k
 end
 
-set_args!(k::Kernel, args::Vararg{Any, N}) where {N} = _set_args!(k, 1, args...)
-@inline _set_args!(k::Kernel, i::Int) = nothing
-@inline function _set_args!(k::Kernel, i::Int, arg, args::Vararg{Any, N}) where {N}
-    set_arg!(k, i, arg)
-    return _set_args!(k, i + 1, args...)
+# one call per argument: a splat of more than 32 arguments isn't a direct call
+@inline @generated function set_args!(k::Kernel, args::Tuple)
+    calls = (:(set_arg!(k, $i, args[$i])) for i in 1:fieldcount(args))
+    return :($(calls...); nothing)
 end
 
 # work sizes padded to the three dimensions OpenCL devices support
@@ -1388,32 +1427,39 @@ function enqueue_kernel(
     return Event(ret_event[])
 end
 
+# kernels are shared by all tasks, and their arguments are state of the kernel object that
+# OpenCL copies when enqueuing it. so setting them and enqueuing the kernel has to happen
+# atomically. manual use of `set_arg!`, `set_args!` or `enqueue_kernel` isn't synchronized;
+# hold `k.lock` while doing so.
 function call(
-        k::Kernel, args::Vararg{Any, N}; global_size = (1,), local_size = nothing,
+        k::Kernel, args::Tuple; global_size = (1,), local_size = nothing,
         global_work_offset = nothing,
         svm_pointers::Union{Nothing, Vector{Ptr{Cvoid}}} = nothing,
         rng_state = false
-    ) where {N}
-    set_args!(k, args...)
-    if svm_pointers !== nothing && !isempty(svm_pointers)
-        clSetKernelExecInfo(
-            k, CL_KERNEL_EXEC_INFO_SVM_PTRS,
-            sizeof(svm_pointers), svm_pointers
-        )
+    )
+    return @lock k.lock begin
+        set_args!(k, args)
+        if svm_pointers !== nothing && !isempty(svm_pointers)
+            clSetKernelExecInfo(
+                k, CL_KERNEL_EXEC_INFO_SVM_PTRS,
+                sizeof(svm_pointers), svm_pointers
+            )
+        end
+        enqueue_kernel(k, global_size, local_size; global_work_offset, rng_state, nargs = length(args))
     end
-    return enqueue_kernel(k, global_size, local_size; global_work_offset, rng_state, nargs = N)
 end
 
 # convert the argument values to match the kernel's signature (specified by the user)
 # (this mimics `lower-ccall` in julia-syntax.scm)
-@inline @generated function convert_arguments(f::Function, ::Type{tt}, args...) where {tt}
+@inline @generated function convert_arguments(f::Function, ::Type{tt}, args::Tuple) where {tt}
     types = tt.parameters
+    nargs = fieldcount(args)
 
     ex = quote end
 
-    converted_args = Vector{Symbol}(undef, length(args))
-    arg_ptrs = Vector{Symbol}(undef, length(args))
-    for i in 1:length(args)
+    converted_args = Vector{Symbol}(undef, nargs)
+    arg_ptrs = Vector{Symbol}(undef, nargs)
+    for i in 1:nargs
         converted_args[i] = gensym()
         arg_ptrs[i] = gensym()
         push!(ex.args, :($(converted_args[i]) = Base.cconvert($(types[i]), args[$i])))
@@ -1424,7 +1470,7 @@ end
         ex.args, (
             quote
                 GC.@preserve $(converted_args...) begin
-                    f($(arg_ptrs...))
+                    f(($(arg_ptrs...),))
                 end
             end
         ).args
@@ -1433,14 +1479,13 @@ end
     return ex
 end
 
-clcall(f::F, types::Tuple, args::Vararg{Any, N}; kwargs...) where {N, F} =
-    clcall(f, _to_tuple_type(types), args...; kwargs...)
+# the arguments are passed as a tuple, see `set_args!`
+clcall(f::F, types::Tuple, args::Tuple; kwargs...) where {F} =
+    clcall(f, _to_tuple_type(types), args; kwargs...)
 
-function clcall(k::Kernel, types::Type{T}, args::Vararg{Any, N}; kwargs...) where {T, N}
-    call_closure = function (converted_args::Vararg{Any, N})
-        return call(k, converted_args...; kwargs...)
-    end
-    return convert_arguments(call_closure, types, args...)
+function clcall(k::Kernel, types::Type{T}, args::Tuple; kwargs...) where {T}
+    call_closure = converted_args -> call(k, converted_args; kwargs...)
+    return convert_arguments(call_closure, types, args)
 end
 
 struct KernelWorkGroupInfo
@@ -1464,7 +1509,8 @@ function Base.getproperty(ki::KernelWorkGroupInfo, s::Symbol)
     elseif s == :compile_size
         Int.(get(CL_KERNEL_COMPILE_WORK_GROUP_SIZE, NTuple{3, Csize_t}))
     elseif s == :local_mem_size
-        Int(get(CL_KERNEL_LOCAL_MEM_SIZE, cl_ulong))
+        # includes the size of local memory arguments, see `call`
+        @lock k.lock Int(get(CL_KERNEL_LOCAL_MEM_SIZE, cl_ulong))
     elseif s == :private_mem_size
         Int(get(CL_KERNEL_PRIVATE_MEM_SIZE, cl_ulong))
     elseif s == :prefered_size_multiple
@@ -1519,10 +1565,10 @@ end
 
 Base.unsafe_convert(::Type{cl_command_queue}, q::CmdQueue) = q.id
 
-function CmdQueue()
+function CmdQueue(ctx::Context = context(), dev::Device = device())
     flags = cl_command_queue_properties(0)
     err_code = Ref{Cint}()
-    queue_id = clCreateCommandQueue(context(), device(), flags, err_code)
+    queue_id = clCreateCommandQueue(ctx, dev, flags, err_code)
     if err_code[] != CL_SUCCESS
         if queue_id != C_NULL
             clReleaseCommandQueue(queue_id)
@@ -1542,6 +1588,7 @@ struct Event
 end
 Base.unsafe_convert(::Type{cl_event}, e::Event) = e.id
 
+const CL_EVENT_COMMAND_QUEUE = 0x11d0
 const CL_EVENT_COMMAND_EXECUTION_STATUS = 0x11d3
 
 function Base.getproperty(evt::Event, s::Symbol)
@@ -1556,11 +1603,58 @@ function Base.getproperty(evt::Event, s::Symbol)
     end
 end
 
+const CL_COMPLETE = 0
 const CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST = -14
 
+# driver notification that a command has completed
+function notify_completion(::cl_event, ::Cint, payload::Ptr{Cvoid})
+    GPUToolbox.signal_completion(payload)
+    return
+end
+function subscribe_completion(evt, payload)
+    callback = @cfunction(notify_completion, Cvoid, (cl_event, Cint, Ptr{Cvoid}))
+    return clSetEventCallback(evt, CL_COMPLETE, callback, payload)
+end
+
+# commands have completed when their execution status is `CL_COMPLETE`, or negative when
+# they were terminated abnormally
+iscomplete(evt::Event) = evt.status <= CL_COMPLETE
+
+blocking_wait(evt::Event) = unchecked_clWaitForEvents(cl_uint(1), Ref(evt.id))
+
+# block the thread while waiting for commands instead, e.g., to make tests independent of
+# how a wait was performed
+const blocking_waits = Ref(false)
+
 function Base.wait(evt::Event)
-    evt_id = Ref(evt.id)
-    err = unchecked_clWaitForEvents(cl_uint(1), evt_id)
+    # wait without blocking the thread, so that other tasks can run in the meantime. after
+    # polling briefly, PoCL notifies us when the command completes: waking a worker thread
+    # to wait for it, or polling for longer, would compete with the command for the CPU
+    # cores it executes on.
+    #
+    # this cannot be interrupted, as kernels may be using memory that callers would release:
+    # an interrupt is only thrown once the kernel has completed (or waiting failed, in which
+    # case we block), but host memory still needs to be synchronized before unwinding.
+    if !blocking_waits[]
+        try
+            # commands only need to start executing once their queue has been flushed
+            queue = Ref{cl_command_queue}()
+            clGetEventInfo(evt, CL_EVENT_COMMAND_QUEUE, sizeof(cl_command_queue), queue, C_NULL)
+            clFlush(queue[])
+
+            cooperative_wait(
+                blocking_wait, evt; subscribe = subscribe_completion, isdone = iscomplete,
+                spin = 10.0e-6
+            )
+        catch
+            blocking_wait(evt)
+            rethrow()
+        end
+    end
+
+    # synchronize host memory and report errors (without blocking anymore, unless waiting
+    # by blocking)
+    err = unchecked_clWaitForEvents(cl_uint(1), Ref(evt.id))
     if err == CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
         error("Kernel execution failed")
     elseif err != CL_SUCCESS

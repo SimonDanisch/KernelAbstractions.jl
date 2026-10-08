@@ -31,9 +31,12 @@ include("atomics.jl")
 include("hostinterface.jl")
 include("localmem.jl")
 include("private.jl")
+include("barriers.jl")
 include("unroll.jl")
 include("nditeration.jl")
 include("offsets.jl")
+include("launch.jl")
+include("foreach_index.jl")
 include("copyto.jl")
 include("devices.jl")
 include("print_test.jl")
@@ -68,6 +71,10 @@ function testsuite(backend, backend_str, backend_mod, AT, DAT; skip_tests = Set{
         private_testsuite(backend, AT)
     end
 
+    @conditional_testset "Barriers" skip_tests begin
+        barrier_testsuite(backend, AT)
+    end
+
     @conditional_testset "Unroll" skip_tests begin
         unroll_testsuite(backend, AT)
     end
@@ -78,6 +85,14 @@ function testsuite(backend, backend_str, backend_mod, AT, DAT; skip_tests = Set{
 
     @conditional_testset "Offsets" skip_tests begin
         offsets_testsuite(backend, AT)
+    end
+
+    @conditional_testset "Launch" skip_tests begin
+        launch_testsuite(backend, AT; skip_tests)
+    end
+
+    @conditional_testset "foreach_index" skip_tests begin
+        foreach_index_testsuite(backend, AT)
     end
 
     @conditional_testset "copyto!" skip_tests begin

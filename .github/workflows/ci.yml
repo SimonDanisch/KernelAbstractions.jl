@@ -28,7 +28,6 @@ jobs:
         version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
         os: [ubuntu-24.04, ubuntu-24.04-arm, macOS-15-intel, macOS-15, windows-2022]
         arch: [x64, arm64]
-        pocl: [jll, local]
         exclude:
           - os: ubuntu-24.04
             arch: arm64
@@ -38,113 +37,15 @@ jobs:
             arch: x64
           - os: macOS-15-intel
             arch: arm64
-          - os: macOS-15-intel
-            pocl: local
           - os: macOS-15
             arch: x64
-          - os: macOS-15
-            pocl: local
-          - os: windows-2022
-            pocl: local
     steps:
       - uses: actions/checkout@v7
-      - uses: julia-actions/install-juliaup@v3
+      - uses: julia-actions/setup-julia@v3
         with:
-          channel: ${{ matrix.version }}
+          version: ${{ matrix.version }}
+          arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v3
-      - name: Checkout pocl
-        if: ${{ matrix.pocl == 'local' }}
-        uses: actions/checkout@v7
-        with:
-          repository: pocl/pocl
-          path: pocl
-      - name: Install system dependencies
-        if: ${{ matrix.pocl == 'local' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build pkg-config
-      - name: Install Julia dependencies
-        if: ${{ matrix.pocl == 'local' }}
-        run: |
-            touch pocl/Project.toml
-            julia --project=pocl --color=yes -e '
-              using Pkg
-              # unversioned
-              # NOTE: the standalone build (ENABLE_ICD=OFF) uses the vendored OpenCL
-              #       headers from PoCL, so OpenCL_jll/OpenCL_Headers_jll are not needed.
-              Pkg.add([
-                "SPIRV_Tools_jll",
-                "Hwloc_jll",
-                "CMake_jll",
-              ])
-              # versioned
-              Pkg.add(name="LLVM_full_jll", version="20")
-              Pkg.add(name="SPIRV_LLVM_Translator_jll", version="20")'
-      - name: Build PoCL
-        if: ${{ matrix.pocl == 'local' }}
-        run: |
-            # Build the standalone (OpenCL-less) variant, mirroring the
-            # pocl_standalone_jll build in Yggdrasil (P/pocl/common.jl):
-            #  - ENABLE_ICD=OFF builds a directly-linkable library instead of an ICD driver;
-            #  - RENAME_POCL=ON renames the cl* entrypoints to POcl*, matching the symbols
-            #    nanoOpenCL.jl @ccalls, so PoCL can coexist with a real OpenCL ICD loader;
-            #  - the sed renames the library itself (libOpenCL -> libpocl_standalone), which
-            #    ENABLE_ICD=OFF would otherwise call "OpenCL", colliding with a system loader.
-            # The local build only runs on Linux (see the matrix excludes), where RENAME_POCL
-            # works against upstream pocl/pocl. The JuliaGPU fork + pocl#2189 are only needed
-            # to make the rename work on macOS, which never runs the local build.
-            sed -i 's/set(POCL_LIBRARY_NAME "OpenCL")/set(POCL_LIBRARY_NAME "pocl_standalone")/' pocl/CMakeLists.txt
-            julia --project=pocl --color=yes -e '
-              using LLVM_full_jll,
-                    SPIRV_Tools_jll, SPIRV_LLVM_Translator_jll, CMake_jll
-              sourcedir = joinpath(@__DIR__, "pocl")
-              builddir = joinpath(@__DIR__, "build")
-              destdir = joinpath(@__DIR__, "target")
-              prefix = []
-              for jll in [SPIRV_Tools_jll, SPIRV_LLVM_Translator_jll]
-                  push!(prefix, jll.artifact_dir)
-              end
-              withenv("LD_LIBRARY_PATH" => joinpath(Sys.BINDIR, Base.PRIVATE_LIBDIR)) do
-                  mkpath(builddir)
-                  run(```cmake -B $builddir -S $sourcedir
-                         -GNinja
-                         -DCMAKE_CXX_FLAGS="-fdiagnostics-color=always"
-                         -DCMAKE_C_FLAGS="-fdiagnostics-color=always"
-                         -DCMAKE_BUILD_TYPE=Debug
-                         -DENABLE_TESTS:Bool=OFF
-                         -DENABLE_ICD:Bool=OFF
-                         -DRENAME_POCL:Bool=ON
-                         -DSTATIC_LLVM:Bool=On
-                         -DPOCL_DEBUG_MESSAGES:Bool=ON
-                         -DCMAKE_INSTALL_PREFIX=$destdir
-                         -DWITH_LLVM_CONFIG=$(LLVM_full_jll.artifact_dir)/tools/llvm-config
-                         -DCMAKE_PREFIX_PATH="$(join(prefix, ";"))"
-                         -DKERNELLIB_HOST_CPU_VARIANTS=distro```)
-                  run(```$(cmake()) --build $builddir --parallel $(Sys.CPU_THREADS) --target install```)
-              end'
-            echo '[pocl_standalone_jll]' > test/LocalPreferences.toml
-            echo 'libpocl_path="${{ github.workspace }}/target/lib/libpocl_standalone.so"' >> test/LocalPreferences.toml
-      # - name: "Co-develop Enzyme and KA"
-      #   run: |
-      #     julia -e '
-      #       using Pkg
-      #       withenv("JULIA_PKG_PRECOMPILE_AUTO" => 0) do
-      #         Pkg.activate("test")
-      #         Pkg.add(["Enzyme", "EnzymeCore"])
-
-      #         # to check compatibility, also add Enzyme to the main environment
-      #         # (or Pkg.test, which merges both environments, could fail)
-      #         Pkg.activate(".")
-      #         # Try to co-develop Enzyme and KA
-      #         try
-      #           Pkg.develop([PackageSpec("Enzyme"), PackageSpec("EnzymeCore")])
-      #         catch err
-      #         end
-      #       end
-      #     '
-      # Nightly tracks the next Julia release; don't fail CI on it
-      - uses: julia-actions/julia-buildpkg@v1
-        continue-on-error: ${{ matrix.version == 'nightly' }}
       # Known limitation: `[sources]` is only supported from Julia 1.11 on, so on 1.10
       # the `KernelInterface = {path = "lib/KernelInterface"}` entry in Project.toml is
       # silently ignored and Pkg resolves KernelInterface from the registry instead --
@@ -152,10 +53,15 @@ jobs:
       # explicitly so 1.10 tests the copy in this repo, like 1.11+ already do.
       #
       # Required on every platform. Windows runs its tests de-escalated below, but that
-      # applies to the test run only, not to `Pkg.develop`.
+      # applies to the test run only, not to `Pkg.develop`. Do this before building, which
+      # already resolves the environment (and fails if this repo requires an unregistered
+      # version of KernelInterface).
       - name: Dev KernelInterface
         shell: bash
         run: julia -e 'using Pkg; Pkg.activate("."); Pkg.develop(; path="lib/KernelInterface")'
+      # Nightly tracks the next Julia release; don't fail CI on it
+      - uses: julia-actions/julia-buildpkg@v1
+        continue-on-error: ${{ matrix.version == 'nightly' }}
       - uses: julia-actions/julia-runtest@v1
         if: runner.os != 'Windows'
         continue-on-error: ${{ matrix.version == 'nightly' }}
@@ -199,9 +105,9 @@ jobs:
         os: [ubuntu-24.04, macOS-15, windows-2022]
     steps:
       - uses: actions/checkout@v7
-      - uses: julia-actions/install-juliaup@v3
+      - uses: julia-actions/setup-julia@v3
         with:
-          channel: ${{ matrix.version }}
+          version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       # Tested on its own, without KernelAbstractions, to keep the sibling
       # package standalone and dependency-free.
@@ -214,47 +120,6 @@ jobs:
         with:
           project: lib/KernelInterface
           annotate: true
-
-  OpenCL:
-    name: OpenCL (POCL)
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        version: ['1.10', '1.11', '1.12', '1.13', 'nightly']
-    steps:
-      - uses: actions/checkout@v7
-      - uses: julia-actions/install-juliaup@v3
-        with:
-          channel: ${{ matrix.version }}
-      - uses: julia-actions/cache@v3
-      - uses: julia-actions/julia-buildpkg@v1
-        continue-on-error: ${{ matrix.version == 'nightly' }}
-      # KernelInterface is dev'ed explicitly here for the same reason as in the CI job
-      # above: Julia 1.10 does not support `[sources]`.
-      - name: "Instantiating project"
-        run: |
-          julia -e 'println("--- :julia: Instantiating project")
-                using Pkg
-                Pkg.develop([PackageSpec(; name="KernelAbstractions", path=pwd()),
-                PackageSpec(; name="KernelInterface", path=joinpath(pwd(), "lib", "KernelInterface"))])' || exit 3
-      - name: "Developing OpenCL"
-        continue-on-error: ${{ matrix.version == 'nightly' }}
-        run: |
-          julia -e 'println("--- :julia: Developing OpenCL")
-                using Pkg
-                Pkg.add(url="https://github.com/JuliaGPU/OpenCL.jl", rev="intrinsics")
-                Pkg.develop(; name="SPIRVIntrinsics")'
-      - name: "Running tests"
-        continue-on-error: ${{ matrix.version == 'nightly' }}
-        run: |
-          julia -e 'println("+++ :julia: Running tests")
-                using Pkg
-                Pkg.test("OpenCL"; coverage=true, test_args=`--platform=pocl pocl/kernelabstractions poclc/kernelabstractions pocl/kernelinterface poclc/kernelinterface`)'
-      - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v7
-        with:
-          files: lcov.info
 
   docs:
     name: Documentation

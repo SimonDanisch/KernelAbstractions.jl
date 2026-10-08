@@ -2,7 +2,7 @@ module POCLKernels
 
 using ..POCL
 using ..POCL: @device_override, cl, method_table
-using ..POCL: device, clconvert, clfunction
+using ..POCL: device, device_limits, clconvert, clfunction
 
 using SPIRV_LLVM_Backend_jll, SPIRV_Tools_jll
 
@@ -18,7 +18,7 @@ import Adapt
 
 export POCLBackend
 
-struct POCLBackend <: KA.GPU
+struct POCLBackend <: KI.Backend
 end
 
 function KI.versioninfo(io::IO, ::POCLBackend)
@@ -75,6 +75,27 @@ end
 
 ## Memory Operations
 
+# GPUCompiler performs 8- and 16-bit atomics on the aligned 32-bit word containing the value,
+# which must not overlap another allocation or storage that is modified independently. That
+# includes adjacent elements of the same array: while an 8- or 16-bit element is updated
+# atomically, the others in its word must not be modified by plain stores concurrently. For
+# arrays of a bits type backed by Julia-owned storage (from here, but also from `resize!`,
+# `copy`, `similar`, ...), that word stays within the same allocation by how Julia's
+# allocator is implemented, not by anything it documents:
+# - Julia 1.11+ (v1.13.1 `src/genericmemory.c`, `jl_alloc_genericmemory_unchecked`): small
+#   `Memory` data starts 16 bytes into an object from a GC pool, whose size classes
+#   (`jl_gc_sizeclasses` in `src/julia_internal.h`) are multiples of 8 bytes, with objects
+#   16-byte aligned (`GC_PAGE_OFFSET` in `src/gc-stock.h`); larger data comes from
+#   `jl_gc_managed_malloc` (`src/gc-stock.c`), which rounds the size up to, and aligns to,
+#   `JL_CACHE_BYTE_ALIGNMENT` (64 or 128 bytes). With MMTk (`src/gc-mmtk.c`), objects are
+#   rounded up to their 16-byte alignment (`jl_mmtk_gc_alloc_default`) and
+#   `jl_gc_managed_malloc` rounds the same way.
+# - Julia 1.10 (v1.10.10 `src/array.c`, `_new_array_`): small arrays store their data at
+#   least 8-byte aligned after the header, in a pool object of the same size classes; larger
+#   ones use `jl_gc_managed_malloc` and `gc_managed_realloc_` (`src/gc.c`), which round and
+#   align as above.
+# Revisit this when Julia's allocator changes. Arrays wrapping foreign memory (e.g., with
+# `unsafe_wrap`) are the user's responsibility, as documented for `CPU`.
 KI.allocate(::POCLBackend, ::Type{T}, dims::Tuple; unified::Bool = false) where {T} = Array{T}(undef, dims)
 
 #  Adapt.jl's `Array` rule converts every `AbstractArray` leaf; `isbits` arrays (ranges, view indices)
@@ -87,12 +108,7 @@ Adapt.adapt_storage(::POCLBackend, x::AbstractArray) = isbits(x) ? x : Adapt.ada
 Adapt.adapt_storage(::KA.ConstAdaptor, a::POCL.CLDeviceArray) = Base.Experimental.Const(a)
 
 
-# Initialized
-
-KA.@kernel function init_kernel(arr, f::F, ::Type{T}) where {F, T}
-    I = KA.@index(Global)
-    @inbounds arr[I] = f(T)
-end
+# Copying
 
 KA.@kernel function copy_kernel(A, @Const(B))
     I = KA.@index(Global)
@@ -100,24 +116,10 @@ KA.@kernel function copy_kernel(A, @Const(B))
 end
 
 
-function KI.zeros(backend::POCLBackend, ::Type{T}, dims::Tuple; kwargs...) where {T}
-    arr = KI.allocate(backend, T, dims; kwargs...)
-    kernel = init_kernel(backend)
-    kernel(arr, zero, T, ndrange = length(arr))
-    return arr
-end
-function KI.ones(backend::POCLBackend, ::Type{T}, dims::Tuple; kwargs...) where {T}
-    arr = KI.allocate(backend, T, dims; kwargs...)
-    kernel = init_kernel(backend)
-    kernel(arr, one, T; ndrange = length(arr))
-    return arr
-end
-
 function KI.copyto!(backend::POCLBackend, A, B)
+    length(A) == length(B) ||
+        throw(ArgumentError("Arrays must match in length, got $(length(A)) and $(length(B))"))
     if KI.get_backend(A) == KI.get_backend(B) && KI.get_backend(A) isa POCLBackend
-        if length(A) != length(B)
-            error("Arrays must match in length")
-        end
         if Base.mightalias(A, B)
             error("Arrays may not alias")
         end
@@ -125,7 +127,8 @@ function KI.copyto!(backend::POCLBackend, A, B)
         kernel(A, B, ndrange = length(A))
         return A
     else
-        return Base.copyto!(A, B)
+        Base.copyto!(A, B)
+        return A
     end
 end
 
@@ -141,214 +144,116 @@ KI.get_backend(::Array) = POCLBackend()
 ## must synchronize upon kernel launch and can't rely on synchronization upon
 ## array access. Therefore, `synchronize` is a no-op.
 KI.synchronize(::POCLBackend) = nothing
-KI.supports_float64(::POCLBackend) = true
+KI.supports_float64(::POCLBackend) = "cl_khr_fp64" in device().extensions
 KI.supports_unified(::POCLBackend) = true
+KI.supports_atomics(::POCLBackend) = true
 
 
 ## Kernel Launch
 
-function KA.mkcontext(kernel::KA.Kernel{POCLBackend}, _ndrange, iterspace)
-    return KA.CompilerMetadata{KA.ndrange(kernel), KA.DynamicCheck}(_ndrange, iterspace)
-end
-function KA.mkcontext(
-        kernel::KA.Kernel{POCLBackend}, I, _ndrange, iterspace,
-        ::Dynamic
-    ) where {Dynamic}
-    return KA.CompilerMetadata{KA.ndrange(kernel), Dynamic}(I, _ndrange, iterspace)
-end
-
-function KA.launch_config(kernel::KA.Kernel{POCLBackend}, ndrange, workgroupsize)
-    if ndrange isa Integer
-        ndrange = (ndrange,)
-    end
-    if workgroupsize isa Integer
-        workgroupsize = (workgroupsize,)
-    end
-
-    # partition checked that the ndrange's agreed
-    if KA.ndrange(kernel) <: KA.StaticSize
-        ndrange = nothing
-    end
-
-    iterspace, dynamic = if KA.workgroupsize(kernel) <: KA.DynamicSize &&
-            workgroupsize === nothing
-        # use ndrange as preliminary workgroupsize for autotuning
-        KA.partition(kernel, ndrange, ndrange)
-    else
-        KA.partition(kernel, ndrange, workgroupsize)
-    end
-
-    return ndrange, workgroupsize, iterspace, dynamic
-end
-
-function threads_to_workgroupsize(threads, ndrange)
-    total = 1
-    return map(ndrange) do n
-        x = min(div(threads, total), n)
-        total *= x
-        return x
-    end
-end
-
-function (obj::KA.Kernel{POCLBackend})(args::Vararg{Any, N}; ndrange = nothing, workgroupsize = nothing) where {N}
-    ndrange, workgroupsize, iterspace, dynamic =
-        KA.launch_config(obj, ndrange, workgroupsize)
-
-    # this might not be the final context, since we may tune the workgroupsize
-    ctx = KA.mkcontext(obj, ndrange, iterspace)
-    kernel = @opencl launch = false obj.f(ctx, args...)
-
-    # figure out the optimal workgroupsize automatically
-    if KA.workgroupsize(obj) <: KA.DynamicSize && workgroupsize === nothing
-        wg_info = cl.work_group_info(kernel.fun, device())
-        wg_size_nd = threads_to_workgroupsize(wg_info.size, KA.NDIteration.extents(ndrange))
-        iterspace, dynamic = KA.partition(obj, ndrange, wg_size_nd)
-        ctx = KA.mkcontext(obj, ndrange, iterspace)
-    end
-
-    groups = length(KA.blocks(iterspace))
-    items = length(KA.workitems(iterspace))
-
-    if groups == 0
-        return nothing
-    end
-
-    # Launch kernel
-    global_size = groups * items
-    local_size = items
-    event = kernel(ctx, args...; global_size, local_size)
-    wait(event)
-    cl.clReleaseEvent(event)
-    return nothing
-end
-
 KI.argconvert(::POCLBackend, arg) = clconvert(arg)
 
-function KI.kernel_function(::POCLBackend, f::F, tt::TT = Tuple{}; name = nothing, kwargs...) where {F, TT}
-    kern = clfunction(f, tt; name, kwargs...)
-    return KI.Kernel{POCLBackend, typeof(kern)}(POCLBackend(), kern)
+# a compiled kernel, and the callable it was compiled from. the compiled kernel only holds
+# pointers to the arrays the callable captures, so the callable has to be kept alive.
+struct POCLKernel{K, F}
+    kernel::K
+    f::F
 end
 
-function (obj::KI.Kernel{POCLBackend})(args...; numworkgroups = (), workgroupsize = (), ndrange = (), max_work_group_size = typemax(Int))
-    KI.check_launch_args(numworkgroups, workgroupsize, ndrange)
+function KI.kernel_function(backend::POCLBackend, f::F, tt::TT = Tuple{}; name = nothing, kwargs...) where {F, TT}
+    # fix the sub-group width, as `KI.sub_group_size` promises. pass it even if the device
+    # has no sub-groups, so that `clfunction` is only compiled for one set of keywords.
+    sub_group_size = device_limits().sub_group_size
+    sub_group_size = sub_group_size > 0 ? sub_group_size : nothing
+    kernel = clfunction(clconvert(f), tt; name, sub_group_size, kwargs...)
+    kern = POCLKernel(kernel, f)
+    return KI.Kernel{POCLBackend, typeof(kern)}(backend, kern)
+end
 
-    # zero-sized ndrange: nothing to launch
-    prod(ndrange) == 0 && return nothing
-
-    numworkgroups, workgroupsize = KI.auto_launch_sizes(obj, numworkgroups, workgroupsize, ndrange, max_work_group_size)
-
-    local_size = (workgroupsize..., ntuple(_ -> 1, 3 - length(workgroupsize))...)
-
-    numworkgroups = (numworkgroups..., ntuple(_ -> 1, 3 - length(numworkgroups))...)
-    global_size = local_size .* numworkgroups
-
-    event = obj.kern(args...; local_size, global_size)
-    wait(event)
-    cl.clReleaseEvent(event)
+function KI.launch(obj::KI.Kernel{POCLBackend}, groups::Dims{3}, items::Dims{3}, args::Tuple)
+    # POCL launches synchronously, see the implementation note on `synchronize`. the
+    # compiled kernel only holds pointers to the arrays captured by `f`, so keep it alive
+    # until the kernel completes.
+    f = obj.kern.f
+    GC.@preserve f POCL.launch_and_wait(
+        obj.kern.kernel, args; local_size = items, global_size = groups .* items
+    )
     return nothing
 end
 
-function KI.kernel_max_work_group_size(kernel::KI.Kernel{<:POCLBackend}; max_work_items::Int = typemax(Int))::Int
-    wginfo = cl.work_group_info(kernel.kern.fun, device())
-    return Int(min(wginfo.size, max_work_items))
+function KI.max_work_group_size(kernel::KI.Kernel{<:POCLBackend})::Int
+    wginfo = cl.work_group_info(kernel.kern.kernel.fun, device())
+    return Int(wginfo.size)
 end
-function KI.max_work_group_size(::POCLBackend)::Int
-    return Int(device().max_work_group_size)
-end
-function KI.sub_group_size(::POCLBackend)::Int
-    # POCL can technically support any sub_group size.
-    #  Check for common values used on GPUs then
-    #  return 1 otherwise
-    sg_sizes = cl.device().sub_group_sizes
-    if 32 in sg_sizes
-        return 32
-    elseif 64 in sg_sizes
-        return 64
-    elseif 16 in sg_sizes
-        return 16
-    else
-        return 1
-    end
-end
+KI.max_work_group_size(::POCLBackend)::Int = device_limits().max_work_group_size
+KI.max_work_group_dims(::POCLBackend)::NTuple{3, Int} = device_limits().max_work_group_dims
+# the grid is only limited by the size of `size_t`
+KI.max_num_groups(::POCLBackend)::NTuple{3, Int} = (typemax(Int), typemax(Int), typemax(Int))
+KI.sub_group_size(::POCLBackend)::Int = device_limits().sub_group_size
 function KI.multiprocessor_count(::POCLBackend)::Int
     return Int(device().max_compute_units)
 end
 
-function KI.shfl_down_types(::POCLBackend)
-    res = copy(SPIRVIntrinsics.gentypes)
-
-    backend_extensions = cl.device().extensions
-    if "cl_khr_fp64" ∉ backend_extensions
-        res = setdiff(res, [Float64])
-    end
-    if "cl_khr_fp16" ∉ backend_extensions
-        res = setdiff(res, [Float16])
-    end
-
-    return res
+KI.supports_subgroups(::POCLBackend) = device_limits().sub_group_size > 0
+function KI.supports_shuffle(backend::POCLBackend, ::Type{T}) where {T}
+    KI.supports_subgroups(backend) || return false
+    T in SPIRVIntrinsics.gentypes || return false
+    T === Float64 && return "cl_khr_fp64" in device().extensions
+    T === Float16 && return "cl_khr_fp16" in device().extensions
+    return true
 end
 
 ## Indexing Functions
 
+# `% T` rather than `T(x)`: a checked conversion leaves an error branch in every kernel.
+# This needs SPIRVIntrinsics 1.1.3, whose 3-D builtins survive the truncation.
+
 @device_override @inline function KI.get_local_id(::Type{T}) where {T}
-    return (; x = T(get_local_id(1)), y = T(get_local_id(2)), z = T(get_local_id(3)))
+    return (; x = get_local_id(1) % T, y = get_local_id(2) % T, z = get_local_id(3) % T)
 end
 
 @device_override @inline function KI.get_group_id(::Type{T}) where {T}
-    return (; x = T(get_group_id(1)), y = T(get_group_id(2)), z = T(get_group_id(3)))
-end
-
-@device_override @inline function KI.get_global_id(::Type{T}) where {T}
-    return (; x = T(get_global_id(1)), y = T(get_global_id(2)), z = T(get_global_id(3)))
+    return (; x = get_group_id(1) % T, y = get_group_id(2) % T, z = get_group_id(3) % T)
 end
 
 @device_override @inline function KI.get_local_size(::Type{T}) where {T}
-    return (; x = T(get_local_size(1)), y = T(get_local_size(2)), z = T(get_local_size(3)))
+    return (; x = get_local_size(1) % T, y = get_local_size(2) % T, z = get_local_size(3) % T)
 end
 
 @device_override @inline function KI.get_num_groups(::Type{T}) where {T}
-    return (; x = T(get_num_groups(1)), y = T(get_num_groups(2)), z = T(get_num_groups(3)))
+    return (; x = get_num_groups(1) % T, y = get_num_groups(2) % T, z = get_num_groups(3) % T)
+end
+
+@device_override @inline function KI.get_global_id(::Type{T}) where {T}
+    return (; x = get_global_id(1) % T, y = get_global_id(2) % T, z = get_global_id(3) % T)
 end
 
 @device_override @inline function KI.get_global_size(::Type{T}) where {T}
-    return (; x = T(get_global_size(1)), y = T(get_global_size(2)), z = T(get_global_size(3)))
+    return (; x = get_global_size(1) % T, y = get_global_size(2) % T, z = get_global_size(3) % T)
 end
 
-@device_override KI.get_sub_group_size() = get_sub_group_size() % UInt32
+@device_override KI.get_sub_group_size(::Type{T}) where {T} = get_sub_group_size() % T
 
-@device_override KI.get_max_sub_group_size() = get_max_sub_group_size() % UInt32
+@device_override KI.get_max_sub_group_size(::Type{T}) where {T} = get_max_sub_group_size() % T
 
-@device_override KI.get_num_sub_groups() = get_num_sub_groups() % UInt32
+@device_override KI.get_num_sub_groups(::Type{T}) where {T} = get_num_sub_groups() % T
 
-@device_override KI.get_sub_group_id() = get_sub_group_id() % UInt32
+@device_override KI.get_sub_group_id(::Type{T}) where {T} = get_sub_group_id() % T
 
-@device_override KI.get_sub_group_local_id() = get_sub_group_local_id() % UInt32
+@device_override KI.get_sub_group_local_id(::Type{T}) where {T} = get_sub_group_local_id() % T
 
-@device_override @inline function KA.__validindex(ctx)
-    if KA.__dynamic_checkbounds(ctx)
-        I = @inbounds KA.expand(KA.__iterspace(ctx), get_group_id(1), get_local_id(1))
-        return I in KA.__ndrange(ctx)
-    else
-        return true
-    end
+## Shared Memory
+
+@device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}) where {T, Dims}
+    ptr = POCL.emit_localmemory(T, Val(prod(Dims)))
+    CLDeviceArray(Dims, ptr)
 end
-
-
-## Shared and Scratch Memory
 
 @device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
     # `CLLocalArray` and not `emit_localmemory` directly: the generator takes
     # `(T, len)` and has no room for `Id`, so the distinctness `Id` promises is
     # arranged by the element type it is given. See `LocalTag`.
     POCL.CLLocalArray(T, Dims, Val(Id))
-end
-
-@device_override @inline function KA.Scratchpad(ctx, ::Type{T}, ::Val{Dims}) where {T, Dims}
-    # private per-workitem scratch: a stack `alloca` (lowered by GPUCompiler) wrapped in a
-    # device array. the slot lives in OpenCL "Function" storage (LLVM addrspace 0), which is
-    # where the SPIR-V target places allocas.
-    ptr = POCL.GPUCompiler.alloca(T, Val(prod(Dims)), Val(POCL.AS.Function))
-    CLDeviceArray(Dims, ptr)
 end
 
 
@@ -369,10 +274,5 @@ end
 @device_override @inline function KI._print(args...)
     POCL._print(args...)
 end
-
-
-## Other
-
-KA.argconvert(::KA.Kernel{POCLBackend}, arg) = clconvert(arg)
 
 end

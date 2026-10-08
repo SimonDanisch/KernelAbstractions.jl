@@ -1,3 +1,11 @@
+# Tests of the KernelAbstractions-related parts of the GPU back-ends. Draft pull requests skip
+# them, unless selected by name in the last commit message: `[only cuda]`, `[only metal, oneapi]`
+# or `[only tests]` for all of them. `[skip amdgpu]` or `[skip tests]` does the opposite.
+# (`opencl` selects the OpenCL.jl tests, on PoCL and on CUDA hardware.)
+#
+# A back end whose branch can't be installed together with this KernelAbstractions (e.g.
+# because it doesn't support this KernelInterface yet) soft-fails with exit status 3,
+# instead of failing the build; test failures still fail it.
 steps:
   - label: "CUDA Julia {{matrix.version}}"
     matrix:
@@ -19,52 +27,25 @@ steps:
                 PackageSpec(; name="KernelInterface", path=joinpath(pwd(), "lib", "KernelInterface"))])' || exit 3
       julia -e 'println("--- :julia: Developing CUDA")
                 using Pkg
-                url="https://github.com/christiangnrd/CUDA.jl"
-                rev="intrinsics"
+                url="https://github.com/JuliaGPU/CUDA.jl"
+                rev="ka-0.10"
                 subdirs = ["CUDACore", "CUDATools", "lib/cusolver", "lib/curand", "lib/cublas", "lib/cufft", "lib/cusparse", "lib/cupti", "lib/nvml", "lib/custatevec", "lib/cudnn", "lib/cutensor", "lib/cutensornet"]
-                Pkg.add([(;url, rev); [(; url, rev, subdir) for subdir in subdirs]])'
+                Pkg.add([(;url, rev); [(; url, rev, subdir) for subdir in subdirs]])' || exit 3
 
       julia -e 'println("+++ :julia: Running tests")
                 using Pkg
                 Pkg.test("CUDA"; coverage=true, test_args=["core/kernelabstractions", "core/kernelinterface"])'
     agents:
       queue: "cuda"
+    if: |
+      build.message !~ /\[skip [^\]]*(tests|cuda)/ &&
+      (build.message =~ /\[only [^\]]*(tests|cuda)/ ||
+       build.message !~ /\[only / && !build.pull_request.draft)
     timeout_in_minutes: 120
     soft_fail:
       - exit_status: 3
     env:
       JULIA_PROJECT: "@cuda"
-
-  # - label: "CUDA Enzyme Julia {{matrix.version}}"
-  #   matrix:
-  #     setup:
-  #       version:
-  #         - "1.10"
-  #         - "1.11"
-  #   plugins:
-  #     - JuliaCI/julia#v1:
-  #         version: "{{matrix.version}}"
-  #     - JuliaCI/julia-coverage#v1:
-  #         codecov: true
-  #   command: |
-  #     julia -e 'println("--- :julia: Instantiating project")
-  #               using Pkg
-  #               try
-  #                  Pkg.develop([PackageSpec(; path=pwd()), PackageSpec("Enzyme"), PackageSpec("EnzymeCore"), PackageSpec("CUDA")])
-  #               catch err
-  #                  Pkg.develop(; path=pwd())
-  #                 Pkg.add(["CUDA", "Enzyme"])
-  #               end' || exit 3
-
-  #     julia -e 'println("+++ :julia: Running tests")
-  #               using CUDA
-  #               include("test/extensions/enzyme.jl")
-  #               enzyme_testsuite(CUDABackend, CuArray, true)'
-  #   agents:
-  #     queue: "cuda"
-  #   timeout_in_minutes: 120
-  #   soft_fail:
-  #     - exit_status: 3
 
   - label: "Metal Julia {{matrix.version}}"
     matrix:
@@ -86,12 +67,16 @@ steps:
                 PackageSpec(; name="KernelInterface", path=joinpath(pwd(), "lib", "KernelInterface"))])' || exit 3
       julia -e 'println("--- :julia: Developing Metal")
                 using Pkg
-                Pkg.add([(; url="https://github.com/JuliaGPU/Metal.jl", rev="kaintr")])'
+                Pkg.add([(; url="https://github.com/JuliaGPU/Metal.jl", rev="ka-0.10")])' || exit 3
       julia -e 'println("+++ :julia: Running tests")
                 using Pkg
                 Pkg.test("Metal"; coverage=true, test_args=["kernelabstractions", "kernelinterface"])'
     agents:
       queue: "metal"
+    if: |
+      build.message !~ /\[skip [^\]]*(tests|metal)/ &&
+      (build.message =~ /\[only [^\]]*(tests|metal)/ ||
+       build.message !~ /\[only / && !build.pull_request.draft)
     timeout_in_minutes: 120
     soft_fail:
       - exit_status: 3
@@ -119,13 +104,17 @@ steps:
       julia -e 'println("--- :julia: Developing oneAPI")
                 using Pkg
                 Pkg.add(url="https://github.com/JuliaGPU/AcceleratedKernels.jl", rev="main")
-                Pkg.add(url="https://github.com/christiangnrd/oneAPI.jl", rev="intrinsics")'
+                Pkg.add(url="https://github.com/JuliaGPU/oneAPI.jl", rev="ka-0.10")' || exit 3
 
       julia -e 'println("+++ :julia: Running tests")
                 using Pkg
                 Pkg.test("oneAPI"; coverage=true, test_args=["kernelabstractions", "kernelinterface"])'
     agents:
       queue: "oneapi"
+    if: |
+      build.message !~ /\[skip [^\]]*(tests|oneapi)/ &&
+      (build.message =~ /\[only [^\]]*(tests|oneapi)/ ||
+       build.message !~ /\[only / && !build.pull_request.draft)
     timeout_in_minutes: 120
     soft_fail:
       - exit_status: 3
@@ -154,13 +143,17 @@ steps:
       julia -e 'println("--- :julia: Developing AMDGPU")
                 using Pkg
                 Pkg.add(url="https://github.com/JuliaGPU/AcceleratedKernels.jl", rev="main")
-                Pkg.add(url="https://github.com/christiangnrd/AMDGPU.jl", rev="intrinsics")'
+                Pkg.add(url="https://github.com/JuliaGPU/AMDGPU.jl", rev="ka-0.10")' || exit 3
 
       julia -e 'println("+++ :julia: Running tests")
                 using Pkg
                 Pkg.test("AMDGPU"; coverage=true, test_args=["kernelabstractions", "kernelinterface"])'
     agents:
       queue: "rocm"
+    if: |
+      build.message !~ /\[skip [^\]]*(tests|amdgpu)/ &&
+      (build.message =~ /\[only [^\]]*(tests|amdgpu)/ ||
+       build.message !~ /\[only / && !build.pull_request.draft)
     timeout_in_minutes: 120
     soft_fail:
       - exit_status: 3
@@ -168,7 +161,7 @@ steps:
       JULIA_PROJECT: "@amdgpu"
       JULIA_NUM_THREADS: 4
 
-  - label: "OpenCL (CUDA) Julia {{matrix.version}}"
+  - label: "OpenCL Julia {{matrix.version}}"
     matrix:
       setup:
         version:
@@ -188,14 +181,20 @@ steps:
                 PackageSpec(; name="KernelInterface", path=joinpath(pwd(), "lib", "KernelInterface"))])' || exit 3
       julia -e 'println("--- :julia: Developing OpenCL")
                 using Pkg
-                Pkg.add(url="https://github.com/JuliaGPU/OpenCL.jl", rev="intrinsics")
-                Pkg.develop(; name="SPIRVIntrinsics")'
+                Pkg.add(url="https://github.com/JuliaGPU/OpenCL.jl", rev="ka-0.10")
+                Pkg.develop(; name="SPIRVIntrinsics")' || exit 3
 
       julia -e 'println("+++ :julia: Running tests")
                 using Pkg
-                Pkg.test("OpenCL"; coverage=true, test_args=`--platform=nvidia nvidia/kernelabstractions nvidia/kernelinterface`)'
+                tests = ["$(target)/$(test)" for target in ("pocl", "poclc", "nvidia")
+                                                 for test in ("kernelabstractions", "kernelinterface")]
+                Pkg.test("OpenCL"; coverage=true, test_args=tests)'
     agents:
       queue: "cuda"
+    if: |
+      build.message !~ /\[skip [^\]]*(tests|opencl)/ &&
+      (build.message =~ /\[only [^\]]*(tests|opencl)/ ||
+       build.message !~ /\[only / && !build.pull_request.draft)
     timeout_in_minutes: 120
     soft_fail:
       - exit_status: 3
@@ -205,5 +204,5 @@ steps:
 
 env:
   JULIA_PKG_PRECOMPILE_AUTO: false
-  JULIA_PKG_SERVER: "" # it often struggles with our large artifacts
+  JULIA_PKG_SERVER_REGISTRY_PREFERENCE: "eager" # see freshly-registered versions without cloning the registry
   SECRET_CODECOV_TOKEN: "c5pjPUwULD2L8ss0gRtjCPiagRlTQ11TdbZP6gIhTPeA/gN5w5/7JvDCg36UpKER6FXnQDeBGGkQafHiLdBaH/FWQ2B2VKErtBarIBJa2zWvKu8mYs9PJzw/qLGT2sMXI9kcao63H6/HAwbslJcY0a5Mg+SwM3M05XqSHgnrHMnbBXysKP6VzFEIX7uoyEKOnoWDj8rGJKFYLW2DBRtd6Yc23ESfFXPAqbS7sgXxwQHKzz20FMQBJUmbiDIzPlk3k2n2TvgAWQ0VNK0e4/UooMbULL3UjY4oaMOF0XpJAnWlmvGgy8gEnZKSVp3ieXy/Ubu7BWwH/BT59wDy6LuDxA==;U2FsdGVkX18Wil69f7qJYu6yU5iNx+Zq8akUcOp+McU1CR4Jw4QBsrUKIF4W4uK+/752FQo40BwFsfnIC8CJ/Q=="

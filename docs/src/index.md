@@ -141,6 +141,27 @@ end
   the CPU backend became an OpenCL backend meant every backend. Use
   `KernelAbstractions.@device_code_llvm` and `KernelAbstractions.@device_code_typed` instead,
   which report on the code a backend actually generates; see [Reflection](@ref).
+- `KernelAbstractions.GPU` is deprecated: and backends should now subtype `KernelAbstractions.Backend` directly. `GPU` is now an alias of `Backend` and will be removed in a future release. Code dispatching on `::GPU` should dispatch on `::Backend`, on concrete
+  backend types, or on a capability such as `KernelAbstractions.supports_float64`.
+- An exception thrown in a kernel on the `CPU` backend is reported as a
+  `KernelAbstractions.POCL.KernelException` when the kernel has completed, like on GPU
+  backends, and no longer as the original exception (e.g., a `BoundsError`). Depending on
+  the debug level (`julia -g`), the kernel prints which exception it threw, on which
+  work-item, and with `-g2` a backtrace.
+- The `CPU` backend runs kernels on as many threads as Julia was started with (`julia -t`),
+  like the thread-based `CPU` backend of 0.9 did, and no longer on one thread per hardware
+  thread. Set `JULIA_KA_CPU_THREADS` to use a different number of threads; see [`CPU`](@ref).
+- `@private` arrays are a `KernelAbstractions.PrivateArray` in stack storage on every backend,
+  instead of a `StaticArrays.MArray` on most GPU backends, which was heap-allocated when passed
+  to a function that isn't inlined. It is still a `StaticArray`, but static-array arithmetic,
+  slicing and fast whole-array reductions now need StaticArrays to be loaded, and `copy` is
+  not supported: write `SVector(Tuple(p))` for an immutable copy. See [`@private`](@ref).
+  Backends no longer need to implement `KernelAbstractions.Scratchpad`: it is an overlay in
+  `GPUCompiler.SHARED_METHOD_TABLE`, which backends that override
+  `GPUCompiler.method_table_view` have to include, e.g., by implementing
+  `GPUCompiler.method_tables` instead.
+- `foreach_index(f, A)` runs `f` once per index of the array `A` without writing a kernel out,
+  and `foreach_index(f, backend, indices)` once per index in a range or `CartesianIndices`.
 
 ## Semantic differences
 

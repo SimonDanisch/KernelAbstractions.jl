@@ -4,7 +4,7 @@ export @opencl, clfunction, clconvert
 ## high-level @opencl interface
 
 const MACRO_KWARGS = [:launch]
-const COMPILER_KWARGS = [:kernel, :name, :always_inline, :validate, :sub_group_size]
+const COMPILER_KWARGS = [:kernel, :name, :always_inline, :debug_level, :validate, :sub_group_size]
 const LAUNCH_KWARGS = [:global_size, :local_size, :queue]
 
 macro opencl(ex...)
@@ -52,7 +52,7 @@ macro opencl(ex...)
 
     # FIXME: macro hygiene wrt. escaping kwarg values (this broke with 1.5)
     #        we esc() the whole thing now, necessitating gensyms...
-    @gensym f_var kernel_f kernel_args kernel_tt kernel
+    @gensym f_var kernel_f kernel_tt kernel
 
     # convert the arguments, call the compiler and launch the kernel
     # while keeping the original arguments alive
@@ -62,8 +62,7 @@ macro opencl(ex...)
             $f_var = $f
             GC.@preserve $(vars...) $f_var begin
                 $kernel_f = $clconvert($f_var)
-                $kernel_args = map($clconvert, ($(var_exprs...),))
-                $kernel_tt = Tuple{map(Core.Typeof, $kernel_args)...}
+                $kernel_tt = $argument_types(($(var_exprs...),))
                 $kernel = $clfunction($kernel_f, $kernel_tt; $(compiler_kwargs...))
                 if $launch
                     $kernel($(var_exprs...); $(call_kwargs...))
@@ -118,11 +117,23 @@ Adapt.adapt_structure(to::KernelAdaptor, r::Base.RefValue{<:Union{DataType, Type
     CLRefType{r[]}()
 
 # case where type is the function being broadcasted
+# (on Julia 1.14, the function type parameter is `Core.TypeEgal{T} <: Type{T}`)
 Adapt.adapt_structure(
     to::KernelAdaptor,
-    bc::Broadcast.Broadcasted{Style, <:Any, Type{T}}
+    bc::Broadcast.Broadcasted{Style, <:Any, <:Type{T}}
 ) where {Style, T} =
     Broadcast.Broadcasted{Style}((x...) -> T(x...), adapt(to, bc.args), bc.axes)
+
+# functions that capture a type, e.g., `Base.Fix1(convert, T)` as used by LinearAlgebra,
+# which isn't a valid kernel argument either
+function Adapt.adapt_structure(to::KernelAdaptor, f::Base.Fix1{<:Any, <:Type{T}}) where {T}
+    g = adapt(to, f.f)
+    return (x...) -> g(T, x...)
+end
+function Adapt.adapt_structure(to::KernelAdaptor, f::Base.Fix2{<:Any, <:Type{T}}) where {T}
+    g = adapt(to, f.f)
+    return (x...) -> g(x..., T)
+end
 
 """
     clconvert(x, [pointers])
@@ -141,6 +152,13 @@ function clconvert(arg, pointers::Union{Nothing, Vector{Ptr{Cvoid}}} = nothing)
     return adapt(KernelAdaptor(pointers), arg)
 end
 
+# `Tuple{map(x -> Core.Typeof(clconvert(x)), args)...}`, without `map`, which isn't type
+# stable for 32 or more elements
+@inline @generated function argument_types(args::Tuple)
+    types = (:(Core.Typeof(clconvert(args[$i]))) for i in 1:fieldcount(args))
+    return :(Tuple{$(types...)})
+end
+
 
 ## abstract kernel functionality
 
@@ -148,12 +166,41 @@ abstract type AbstractKernel{F, TT} end
 
 pass_arg(@nospecialize dt) = !(GPUCompiler.isghosttype(dt) || Core.Compiler.isconstType(dt))
 
-@inline @generated function (kernel::AbstractKernel{F, TT})(
-        args::Vararg{Any, N};
-        global_size = (1,), local_size = nothing
-    ) where {F, TT, N}
+# The arguments are passed on as a tuple: Julia doesn't turn a splat of more than 32
+# elements into a direct call, and a method with both varargs and keyword arguments splats
+# them into its body. So the keyword method is defined explicitly.
+(kernel::AbstractKernel)(args::Vararg{Any, N}) where {N} = launch_and_wait(kernel, args)
+Core.kwcall(kwargs::NamedTuple, kernel::AbstractKernel, args::Vararg{Any, N}) where {N} =
+    launch_and_wait(kernel, args; kwargs...)
+
+# kernels operate on plain `Array`s, whose uses can't synchronize, so every launch waits for
+# its kernel. this also keeps the arguments alive while the kernel runs. waiting yields to
+# other tasks, as `synchronize` should (see the documentation on its semantics).
+function launch_and_wait(kernel::AbstractKernel, args::Tuple; kwargs...)
+    info = exception_info()
+    info[] = ExceptionInfo_st()
+    GC.@preserve args info begin
+        event = launch_tuple(kernel, args, Base.unsafe_convert(Ptr{ExceptionInfo_st}, info); kwargs...)
+        try
+            wait(event)
+        finally
+            cl.clReleaseEvent(event)
+        end
+    end
+    info[].status == 0 || throw(KernelException(device()))
+    return nothing
+end
+
+@inline launch_tuple(
+    kernel::AbstractKernel, args::Tuple, exception_info::Ptr;
+    global_size = (1,), local_size = nothing
+) = launch_converted(kernel, args, exception_info, global_size, local_size)
+
+@inline @generated function launch_converted(
+        kernel::AbstractKernel{F, TT}, args::Tuple, exception_info, global_size, local_size
+    ) where {F, TT}
     sig = Tuple{F, TT.parameters...}    # Base.signature_type with a function type
-    args = (:(kernel.f), (:(clconvert(args[$i])) for i in 1:length(args))...)
+    args = (:(kernel.f), (:(clconvert(args[$i])) for i in 1:fieldcount(args))...)
 
     # filter out ghost arguments that shouldn't be passed
     to_pass = map(pass_arg, sig.parameters)
@@ -169,15 +216,42 @@ pass_arg(@nospecialize dt) = !(GPUCompiler.isghosttype(dt) || Core.Compiler.isco
     end
 
     pushfirst!(call_t, KernelState)
-    pushfirst!(call_args, :(KernelState(kernel.rng_state ? Base.rand(UInt32) : UInt32(0))))
+    pushfirst!(
+        call_args,
+        :(KernelState(kernel.rng_state ? Base.rand(UInt32) : UInt32(0), UInt64(UInt(exception_info))))
+    )
 
     # finalize types
     call_tt = Base.to_tuple_type(call_t)
 
+    # the converted arguments only hold pointers to the arrays in `args`
     return quote
-        $cl.clcall(kernel.fun, $call_tt, $(call_args...); global_size, local_size, kernel.rng_state)
+        GC.@preserve args begin
+            $cl.clcall(kernel.fun, $call_tt, ($(call_args...),); global_size, local_size, kernel.rng_state)
+        end
     end
 end
+
+
+## exceptions
+
+"""
+    KernelException
+
+An exception thrown during kernel execution on device `dev`. The kernel prints details about
+the exception when it occurs, depending on the debug level (see Julia's `-g` option).
+"""
+struct KernelException <: Exception
+    dev::cl.Device
+end
+
+Base.showerror(io::IO, err::KernelException) =
+    print(io, "KernelException: exception thrown during kernel execution on device ", err.dev.name)
+
+# where kernels report exceptions: per task, as a task waits for every kernel it launches
+exception_info() = get!(task_local_storage(), :POCLExceptionInfo) do
+    Ref(ExceptionInfo_st())
+end::Base.RefValue{ExceptionInfo_st}
 
 
 ## host-side kernels
@@ -201,8 +275,8 @@ function clfunction(f::F, tt::TT = Tuple{}; kwargs...) where {F, TT}
 
         res = compile_or_lookup(job)::OpenCLResults
 
-        # Resolve the cl.Kernel for the active context. Linear scan over the
-        # session-local cache; almost always n=1, so this is one `===` compare.
+        # Resolve the cl.Kernel for the session's context. There's one context per
+        # session, so this is one `===` compare.
         ctx = context()
         cached = nothing
         @inbounds for (cached_ctx, cached_kernel) in res.kernels
@@ -217,6 +291,8 @@ function clfunction(f::F, tt::TT = Tuple{}; kwargs...) where {F, TT}
             # results struct is serialized into the package image along with its
             # CodeInstance, and the handles would come back dangling.
             if ccall(:jl_generating_output, Cint, ()) != 1
+                # kernels for other contexts are from before a reset of the session
+                empty!(res.kernels)
                 push!(res.kernels, (ctx, linked))
             end
             linked
@@ -224,10 +300,8 @@ function clfunction(f::F, tt::TT = Tuple{}; kwargs...) where {F, TT}
             cached
         end
 
-        h = hash(kernel, hash(f, hash(tt)))
-        return get!(_kernel_instances, h) do
-            HostKernel{F, tt}(f, kernel, res.device_rng)
-        end::HostKernel{F, tt}
+        # not cached: that would keep every callable that was ever launched alive
+        return HostKernel{F, tt}(f, kernel, res.device_rng)
     end
 end
 
@@ -238,14 +312,15 @@ end
 # `cached_results` returns `nothing` until code exists for the job; `obj === nothing`
 # then identifies an `OpenCLResults` that hasn't been compiled yet. Compiling populates
 # Julia's code cache, so the post-compile `cached_results` re-fetch is guaranteed to
-# succeed. The `compile_hook` check additionally forces the compile path so
-# reflection-style consumers (`@device_code_*`) observe the compilation even on a hit.
+# succeed. Every lookup is reported to the `@device_code_*` hook, so reflection
+# observes cached kernels without recompiling them.
 # Keep this specialized so the caller can avoid boxing `CompilerJob`. Its type parameters
 # only identify the target and compiler parameters, so this is bounded per back-end rather
 # than specialized for every kernel; `@noinline` keeps the body out of each `clfunction`.
 @noinline function compile_or_lookup(job::CompilerJob)::OpenCLResults
+    GPUCompiler.run_compile_hook(job)
     res = GPUCompiler.cached_results(OpenCLResults, job)
-    if res === nothing || res.obj === nothing || GPUCompiler.compile_hook[] !== nothing
+    if res === nothing || res.obj === nothing
         compiled = compile_to_obj(job)
         if res === nothing
             res = GPUCompiler.cached_results(OpenCLResults, job)::OpenCLResults
@@ -256,6 +331,3 @@ end
     end
     return res
 end
-
-# cache of kernel instances
-const _kernel_instances = Dict{UInt, Any}()

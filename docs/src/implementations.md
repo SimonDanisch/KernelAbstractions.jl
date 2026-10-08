@@ -1,6 +1,6 @@
 # [Notes for backend implementations](@id implementations_notes)
 
-The [KernelInterface](@ref kernelinterface) sibling package defines the core interface a backend must implement. A backend must implement a backend type that subtypes `KernelInterface.GPU`, or `KernelInterface.Backend` for non-gpu backends. This documentation contains the host and devices side functions that backends can define, as well as whether they are mandatory or not.
+The [KernelInterface](@ref kernelinterface) sibling package defines the core interface a backend must implement. A backend must implement a backend type that subtypes `KernelInterface.Backend`. This documentation contains the host and devices side functions that backends can define, as well as whether they are mandatory or not.
 
 ## Semantics of `KernelAbstractions.synchronize`
 
@@ -75,3 +75,53 @@ to the backend's array type, so that `adapt(backend, x)` and
 Adapt.adapt_storage(::CUDABackend, x) = adapt(CuArray, x)
 ```
 
+
+## Launching `@kernel` kernels
+
+KernelAbstractions launches [`@kernel`](@ref) kernels on any backend that implements
+[KernelInterface](@ref kernelinterface): it partitions the `ndrange`, builds the kernel's
+hidden context (a `KernelAbstractions.CompilerMetadata`), compiles the kernel with
+[`KI.kernel_function`](@ref KernelInterface.kernel_function), tunes the workgroup size, and
+launches it with [`KI.launch`](@ref KernelInterface.launch). A backend doesn't implement any
+of that itself, but it needs KernelInterface's typed index queries and an N-d
+[`KI.launch`](@ref KernelInterface.launch), and it must not override KernelAbstractions' index
+functions (see below). [`@private`](@ref) storage is implemented by an overlay in
+`GPUCompiler.SHARED_METHOD_TABLE`, so a GPUCompiler-based backend has to include that table:
+it should return its method tables from `GPUCompiler.method_tables` rather than override
+`GPUCompiler.method_table_view`. It **may** customize the launch through:
+
+- [`KI.launch_configuration`](@ref KernelInterface.launch_configuration): the workgroup size
+  used when the kernel has no static or given one. It receives the number of work-items in
+  the `ndrange` as `nitems`, e.g. to prefer more workgroups over larger ones.
+- [`KernelAbstractions.compiler_options`](@ref): compiler options for a kernel, e.g. a
+  register hint derived from its static workgroup size.
+- `Adapt.adapt_storage(::KernelAbstractions.ConstAdaptor, x)` for the backend's device
+  arrays, which implements [`@Const`](@ref).
+
+[`@index`](@ref) computes its indices from how a kernel was launched: on a grid with the
+shape of the iteration space ([`NDLaunch`](@ref KernelAbstractions.NDLaunch), for up to as
+many dimensions as the backend's grid has), which doesn't need any divisions, or on a 1-D
+grid ([`LinearLaunch`](@ref KernelAbstractions.LinearLaunch)). Either way it computes in a
+narrow index type such as `Int32` when the iteration space fits, which is why the typed
+[`KI.get_group_id`](@ref KernelInterface.get_group_id) and
+[`KI.get_local_id`](@ref KernelInterface.get_local_id) queries have to compute in that type
+too, as KernelInterface specifies. For the same reason, backends **must not** override
+`__validindex` or the `__index_*` functions.
+
+A backend can still implement `(obj::KernelAbstractions.Kernel{MyBackend})(args...; ndrange, workgroupsize)`
+to launch kernels itself, e.g. while it is being ported to KernelInterface. That relies on
+KernelAbstractions internals: it has to choose the launch with
+[`select_launch`](@ref KernelAbstractions.select_launch), pass it to the kernel's context,
+and tune the workgroup size with
+[`launch_workgroupsize`](@ref KernelAbstractions.launch_workgroupsize), as the generic
+launch in `src/backend_launch.jl` does.
+
+Packages that customize the iteration space (with a custom `partition` and `expand`)
+don't need to do anything for these launches: the index functions only compute the global
+index directly for the iteration spaces KernelAbstractions creates itself, and call
+`expand`, `in` and `linear_index` otherwise.
+
+Packages with an `Adapt` rule for `CompilerMetadata` **must** preserve its `launch`, e.g. by
+passing `launch = KernelAbstractions.__launch(ctx)` to the constructor. Otherwise the
+kernel computes its indices as if it had been launched on a 1-D grid, which gives wrong
+results for a kernel launched with an `NDLaunch`.
