@@ -23,6 +23,8 @@ include("matrix.jl")
 include("caps.jl")
 # The cooperative-matrix type and the eleven operations a backend lowers.
 include("coopmat.jl")
+# Loading and storing a matrix through a description of the array in memory.
+include("tensor.jl")
 # Graphics vocabulary a compiler and a backend both dispatch on, for the same
 # reason the matrix vocabulary is here.
 include("topology.jl")
@@ -61,6 +63,14 @@ include("mesh.jl")
             :functional, :versioninfo,
             :supports_unified, :supports_atomics, :supports_float64,
             :supports_subgroups, :supports_shuffle,
+            # cooperative-matrix extensions and tensor addressing
+            :coopmat_perelement, :coopmat_reduce, :CoopMatReduce,
+            :supports_coopmat_perelement, :supports_coopmat_reduce,
+            :supports_flexible_coopmat_shapes,
+            :TensorLayout, :TensorView, :TENSOR_CLAMP_UNDEFINED, :TENSOR_CLAMP_CONSTANT,
+            :TENSOR_CLAMP_TO_EDGE, :tensor_layout, :tensor_setdim, :tensor_setstride,
+            :tensor_setclampvalue, :tensor_clampbits, :tensor_slice, :tensor_view,
+            :tensor_load, :tensor_store, :supports_tensor_addressing,
         )
     )
 end

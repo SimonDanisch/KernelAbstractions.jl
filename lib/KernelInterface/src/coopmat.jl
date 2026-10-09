@@ -244,3 +244,54 @@ function coopmat_getcomp end
 
 """    coopmat_setcomp(m, i, v) -> `m` with this invocation's `i`-th component set."""
 function coopmat_setcomp end
+
+# ── Beyond load, store and multiply-add ──────────────────────────────────────
+#
+# Vendor extensions, not portable even across one API (see `DeviceCaps`): a kernel
+# that wants one asks its predicate and carries the answer. Vulkan reaches both
+# through `VK_NV_cooperative_matrix2`.
+
+"""
+    coopmat_perelement(f, m, extras...) -> CoopMatrix
+
+`m` with every element replaced by `f(row, col, element, extras...)`, `row` and
+`col` zero-based. `f` must be a top-level function, not a closure: anything it would
+capture goes in `extras`. Ask [`supports_coopmat_perelement`](@ref) first.
+"""
+function coopmat_perelement end
+
+"""
+    coopmat_reduce(f, Dst::Type{<:CoopMatrix}, m, Val(mask)) -> Dst
+
+Combine `m` along `mask` (see [`CoopMatReduce`](@ref)) with the binary function `f`
+(`max` for a row maximum), into a matrix of type `Dst` that holds the reduced value
+repeated along the reduced axis — not a vector. `f` must be a top-level function.
+Ask [`supports_coopmat_reduce`](@ref) first.
+"""
+function coopmat_reduce end
+
+"""
+The axes [`coopmat_reduce`](@ref) combines along. `Row` and `Column` are bits, so
+`RowAndColumn` is their union; `TwoByTwo` is the remaining bit and is unverified.
+"""
+module CoopMatReduce
+const Row          = UInt32(1)
+const Column       = UInt32(2)
+const RowAndColumn = UInt32(3)
+const TwoByTwo     = UInt32(4)
+end
+
+"""    supports_coopmat_perelement(backend)::Bool — [`coopmat_perelement`](@ref) is available. The fallback is `false`."""
+supports_coopmat_perelement(::Backend) = false
+
+"""    supports_coopmat_reduce(backend)::Bool — [`coopmat_reduce`](@ref) is available. The fallback is `false`."""
+supports_coopmat_reduce(::Backend) = false
+
+"""
+    supports_flexible_coopmat_shapes(backend)::Bool
+
+Whether a subgroup-scope matrix may have a shape the device's table
+([`matrix_shapes`](@ref)) does not list, at the table's granularity — a 64x16
+operand on a device that reports only M = 16. The fallback is `false`.
+"""
+supports_flexible_coopmat_shapes(::Backend) = false
