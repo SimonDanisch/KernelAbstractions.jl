@@ -349,6 +349,31 @@ Returns a vector of `DataType`s supported on `backend`
 """
 sub_group_reduce_add_types(::Backend) = DataType[]
 
+## integer arithmetic
+
+"""
+    dot4x8(a::UInt32, b::UInt32)::Int32
+
+The dot product of the four signed 8-bit integers packed in `a` with the four packed in
+`b`, byte `i` of one with byte `i` of the other, exact in 32 bits.
+
+GPUs have an instruction for it (SPIR-V's `OpSDot` with the packed 4x8 format, AMD's
+`v_dot4`, NVIDIA's `dp4a`): four multiply-adds in one, which is what an int8
+matrix-vector product spends its time on.
+
+!!! note
+    The definition here is the reference and runs anywhere. Backends with the
+    instruction override it:
+    ```
+    @device_override dot4x8(a::UInt32, b::UInt32)
+    ```
+"""
+@inline function dot4x8(a::UInt32, b::UInt32)
+    byte(x, i) = Int32((x >> (8 * i)) % Int8)
+    return byte(a, 0) * byte(b, 0) + byte(a, 1) * byte(b, 1) +
+           byte(a, 2) * byte(b, 2) + byte(a, 3) * byte(b, 3)
+end
+
 ## synchronization
 
 """
