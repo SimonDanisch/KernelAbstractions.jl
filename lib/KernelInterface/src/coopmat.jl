@@ -146,6 +146,16 @@ Store the tile back. Lowers to `OpCooperativeMatrixStoreKHR`.
     coopmat_store(dst, offset, stride, m)
 
 """
+    copyto!(dst, offset, stride, m, Val(true))   # row-major
+
+The store's layout operand, the mirror of the load's. Lava declared it for its
+shared arrays only, so a kernel storing a tile row-major (DNNKernels'
+`attn_flash_rows!`) had no method on any other backend.
+"""
+@inline Base.copyto!(dst, offset::Integer, stride::Integer, m::CoopMatrix, rowmajor::Val) =
+    coopmat_store(dst, offset, stride, m, rowmajor)
+
+"""
     convert(AcceleratedMatrix{T,M,N,U}, m)
 
 Change a tile's component type in registers. Lowers to `OpFConvert`.
