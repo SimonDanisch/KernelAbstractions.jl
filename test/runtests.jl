@@ -75,9 +75,13 @@ end
         fadd_f64_global = true, fadd_f64_local = true
     )
     @test POCL.compiler_config(dev).target.atomics == atomics
-    # explicitly requested extensions are kept
+    # explicitly requested extensions are kept, in addition to the default ones and the one
+    # for vector shuffles
+    @test POCL.compiler_config(dev).target.extensions ==
+        "+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups"
     config = POCL.compiler_config(dev; extensions = "+SPV_KHR_expect_assume")
-    @test config.target.extensions == "+SPV_KHR_expect_assume"
+    @test config.target.extensions ==
+        "+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups,+SPV_KHR_expect_assume"
     @test config.target.atomics == atomics
     @test POCL.compiler_config(dev; extensions = nothing).target ==
         POCL.compiler_config(dev).target
@@ -214,6 +218,73 @@ end
     @test A == ref
 end
 
+@testset "POCL reinterpret" begin
+    @kernel function reinterpret_copy!(out, a)
+        I = @index(Global, Linear)
+        @inbounds out[I] = reinterpret(eltype(out), a)[I]
+    end
+    a = Float32[1, 2, 3, 4]
+    @testset "$T" for T in (UInt32, UInt16)
+        out = zeros(T, length(reinterpret(T, a)))
+        reinterpret_copy!(CPU())(out, a; ndrange = length(out))
+        synchronize(CPU())
+        @test out == reinterpret(T, a)
+    end
+
+    # like on the host, arrays of non-bitstypes can't be reinterpreted
+    out = zeros(UInt8, 1)
+    @test_throws POCL.KernelException redirect_stdout(devnull) do
+        reinterpret_copy!(CPU())(out, Union{Int8, UInt8}[Int8(-1)]; ndrange = 1)
+        synchronize(CPU())
+    end
+end
+
+# `@Const` arguments are constified by the launch, using the mask of the kernel method
+# that is called
+@kernel function const_seen!(out, @Const(B::AbstractVector))
+    I = @index(Global, Linear)
+    @inbounds out[I] = B isa POCL.Const
+end
+@kernel function const_seen!(out, B::Number)
+    I = @index(Global, Linear)
+    @inbounds out[I] = B isa POCL.Const
+end
+@kernel function const_seen_vararg!(out, @Const(B), Cs...)
+    I = @index(Global, Linear)
+    @inbounds out[I] = (B isa POCL.Const) && !any(C -> C isa POCL.Const, Cs)
+end
+# the defaults are evaluated on the device, not when looking up which arguments are
+# `@Const`, and can refer to the ones before them
+@kernel function const_seen_default!(
+        out, @Const(B), C = B isa POCL.Const || error("evaluated on the host"), D = C
+    )
+    I = @index(Global, Linear)
+    @inbounds out[I] = C && D
+end
+@kernel generated = true function const_seen_generated!(out, @Const(B))
+    I = @index(Global, Linear)
+    @inbounds out[I] = $(B <: POCL.Const)
+end
+@testset "POCL @Const arguments" begin
+    B = ones(Float32, 4)
+    @testset "$name" for (name, kernel, args, expected) in (
+            ("marked method", const_seen!, (B,), true),
+            ("unmarked method", const_seen!, (1.0f0,), false),
+            ("varargs", const_seen_vararg!, (B, B, B), true),
+            ("default arguments", const_seen_default!, (B,), true),
+            ("default argument given", const_seen_default!, (B, true), true),
+            ("generated", const_seen_generated!, (B,), true),
+        )
+        out = zeros(Bool, 4)
+        kernel(CPU())(out, args...; ndrange = length(out))
+        synchronize(CPU())
+        @test all(==(expected), out)
+    end
+    @test_throws "`@Const` cannot be applied to varargs" macroexpand(
+        @__MODULE__, :(@kernel function const_varargs!(out, @Const(Bs...)) end)
+    )
+end
+
 # `randn`/`randexp` for Float16 route through Random's table-free fallback, whose polar
 # transform overflows in Float16 and whose `log1p` isn't available for Float16 on the
 # device. The device overlays compute in Float32 and convert, so results stay finite.
@@ -235,6 +306,84 @@ if "cl_khr_fp16" in POCL.device().extensions
         @test all(isfinite, a)
         @test all(isfinite, b)
     end
+end
+
+# the sub-group width kernels are compiled for is the one `KI.sub_group_size` reports
+# (PoCL folds `get_max_sub_group_size` to that constant itself, see pocl/pocl#2375)
+function max_sub_group_size_kernel(out)
+    out[1] = KernelAbstractions.KernelInterface.get_max_sub_group_size()
+    return
+end
+@testset "POCL sub-group width" begin
+    out = zeros(Int, 1)
+    @opencl max_sub_group_size_kernel(out)
+    @test out[1] == POCL.device_limits().sub_group_size
+end
+
+# the native sub-group collectives are used where they have Julia's semantics
+function sub_group_reduce_kernel(out, x)
+    i = KernelAbstractions.KernelInterface.get_global_id().x
+    out[i] = KernelAbstractions.KernelInterface.sub_group_reduce(+, x[i])
+    return
+end
+function sub_group_exclusive_scan_kernel(out, x)
+    i = KernelAbstractions.KernelInterface.get_global_id().x
+    out[i] = KernelAbstractions.KernelInterface.sub_group_exclusive_scan(+, x[i], eltype(x)(7))
+    return
+end
+@testset "POCL native sub-group collectives" begin
+    W = POCL.device_limits().sub_group_size
+    for T in (Int32, Float32)
+        x, out = ones(T, W), zeros(T, W)
+        ir = sprint() do io
+            @device_code_llvm io = io debuginfo = :none @opencl local_size = W global_size = W sub_group_reduce_kernel(out, x)
+        end
+        @test all(==(W), out)
+        @test occursin("sub_group_reduce_add", ir)
+
+        ir = sprint() do io
+            @device_code_llvm io = io debuginfo = :none @opencl local_size = W global_size = W sub_group_exclusive_scan_kernel(out, x)
+        end
+        @test out == 7 .+ (0:(W - 1))
+        @test occursin("sub_group_scan_exclusive_add", ir)
+    end
+end
+
+# structs are packed into words, which are exchanged with as few vector shuffles as possible
+function packed_shuffle_kernel(out, x)
+    KI = KernelAbstractions.KernelInterface
+    i = KI.get_global_id().x
+    out[i] = KI.shfl(x[i], KI.get_sub_group_local_id() % KI.get_sub_group_size() + 1)
+    return
+end
+@testset "POCL vector shuffles of packed structs" begin
+    W = POCL.device_limits().sub_group_size
+    for n in (1, 2, 5, 16, 17, 18, 33)
+        x = [ntuple(k -> UInt32(1000i + k), n) for i in 1:2W]
+        out = similar(x)
+        ir = sprint() do io
+            @device_code_llvm io = io debuginfo = :none @opencl local_size = 2W global_size = 2W packed_shuffle_kernel(out, x)
+        end
+        @test out == [x[fld(i - 1, W) * W + mod1(i - fld(i - 1, W) * W + 1, W)] for i in 1:2W]
+        # vectors of up to 16 words, and a single word as a scalar
+        @test count(r"call [^\n]*SubgroupShuffleINTEL", ir) == fld(n, 16) + (n % 16 >= 2)
+    end
+end
+
+# `@groupreduce` reduces sub-groups with PoCL's native collectives
+@kernel function groupreduce_codegen!(out, @Const(x))
+    i = @index(Global, Linear)
+    res = @groupreduce(+, x[i], zero(eltype(out)))
+    out[i] = res
+end
+@testset "POCL @groupreduce with sub-groups" begin
+    x = ones(Int32, 100)
+    out = zeros(Int32, 100)
+    ir = sprint() do io
+        @device_code_llvm io = io debuginfo = :none groupreduce_codegen!(POCLBackend(), 64)(out, x; ndrange = 100)
+    end
+    @test out == [fill(64, 64); fill(36, 36)]
+    @test occursin("sub_group_reduce_add", ir)
 end
 
 # Julia doesn't turn a splat of more than 32 elements into a direct call, so a launch with
@@ -492,6 +641,37 @@ end
     @test_throws ArgumentError fill_index!(CPU())(zeros(Int, 1); ndrange = (2^22, 2^22, 2^22, 1), workgroupsize = 1)
 end
 
+@testset "POCL workgroup size" begin
+    workgroupsize = POCL.POCLKernels.cpu_workgroupsize
+    for threads in (1, 3, 4, 7, 64), max_items in (1, 7, 64, 4096), nitems in (nothing, 0, 1, 1000, 4096, 2^20, typemax(Int))
+        items = workgroupsize(nitems, threads, max_items, 8)
+        @test 1 <= items <= max_items
+        # a power of two, unless limited by `max_items`
+        ispow2(max_items) && @test ispow2(items)
+        # splitting stops with more than half as many workgroups as threads, or at the
+        # minimum of 4 times the preferred multiple
+        if nitems !== nothing
+            @test 2 * cld(max(nitems, 1), items) > threads || items < 2 * min(32, max_items)
+        end
+    end
+    # PoCL's choice for the same launches (`pocl_default_local_size_optimizer`)
+    for (nitems, threads, items) in (
+            (1024, 1, 1024), (1024, 4, 256), (1024, 8, 128), (4096, 4, 1024), (4096, 8, 512),
+            (16384, 4, 4096), (16384, 8, 2048), (65536, 8, 4096), (4096, 64, 64),
+        )
+        @test workgroupsize(nitems, threads, 4096, 8) == items
+    end
+    # the floor follows the preferred multiple
+    @test workgroupsize(1024, 32, 4096, 8) == 32
+    @test workgroupsize(1024, 32, 4096, 16) == 64
+    # unlike PoCL, launches too small to split over all threads split down to the floor
+    @test workgroupsize(1000, 64, 4096, 8) == 32
+    @test workgroupsize(4096, 192, 4096, 8) == 32
+    @test workgroupsize(64, 64, 4096, 8) == 32
+    # more threads don't mean larger workgroups
+    @test issorted([workgroupsize(4096, threads, 4096, 8) for threads in 1:64]; rev = true)
+end
+
 # the shared testsuite only covers the launch configuration POCL selects
 @testset "POCL launch configurations" begin
     KA = KernelAbstractions
@@ -516,8 +696,8 @@ end
         A[ndrange] .= 0
         @test all(iszero, A)
 
-        # the launch is chosen from the iteration space
-        @test KA.select_launch(kernel, nothing, iterspace) === KA.NDLaunch{Int32}()
+        # the launch is chosen from the iteration space, computing indices in `Int` on PoCL
+        @test KA.select_launch(kernel, nothing, iterspace) === KA.NDLaunch{Int}()
     end
     for launch in (nothing, KA.LinearLaunch{Int}(), KA.NDLaunch{Int}())
         function launcher(kernel, args...; ndrange, workgroupsize = nothing)

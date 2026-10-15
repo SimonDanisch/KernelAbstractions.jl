@@ -17,6 +17,7 @@ using FileCheck
 using KernelAbstractions
 using KernelAbstractions: @atomic
 using StaticArrays
+import KernelAbstractions.KernelInterface as KI
 using Test
 
 import KernelAbstractions.POCL: @device_code_llvm
@@ -76,6 +77,19 @@ end
 @kernel function codegen_global_linear(A)
     I = @index(Global, Linear)
     @inbounds A[I] = I
+end
+
+@kernel function codegen_scale_cartesian(A)
+    I = @index(Global, Cartesian)
+    @inbounds A[I] = 2 * A[I]
+end
+
+# a 64-bit primitive type that no backend shuffles natively
+primitive type CodegenBits64 64 end
+
+@kernel function codegen_shfl_bits64(A)
+    I = @index(Global, Linear)
+    @inbounds A[I] = reinterpret(UInt64, KI.shfl(reinterpret(CodegenBits64, A[I]), 1))
 end
 
 # `@inbounds` is only honoured under `--check-bounds=auto`; several checks below assert
@@ -202,6 +216,21 @@ end
         end
     end
 
+    # PoCL computes indices in 64 bits, like its work-item ids, and the index arithmetic
+    # can't wrap. Narrowing the ids to 32 bits and widening the indices again keeps PoCL from
+    # vectorizing its loops over the work-items when they are short (#868).
+    @testset "index type" begin
+        B = KernelAbstractions.zeros(backend, Float32, 4, 64)
+        @test @filecheck implicit_check_not = "trunc i64" begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_scale_cartesian"
+            @check "shl nuw nsw i64"
+            @check "add nuw {{(nsw )?}}i64"
+            @check "ret void"
+            @device_code_llvm debuginfo = :none codegen_scale_cartesian(backend, (4, 16))(B, ndrange = size(B))
+            KernelAbstractions.synchronize(backend)
+        end
+    end
+
     # With StaticArrays loaded, whole-array reductions over `@private` storage are unrolled,
     # so the stack slot is promoted to registers rather than read through memory.
     @testset "private" begin
@@ -218,6 +247,48 @@ end
             @check "define spir_kernel void @{{.*}}gpu_codegen_private_escape"
             @check "alloca"
             @device_code_llvm debuginfo = :none codegen_private_escape(backend, 16)(A, ndrange = 64)
+            KernelAbstractions.synchronize(backend)
+        end
+    end
+
+    # The bounds check of a partial workgroup compares every dimension and branches once.
+    # Branching per dimension (as `all` does on Julia 1.10–1.12) keeps PoCL from
+    # hoisting the index computation out of its loop over the work-items, which made
+    # kernels with a linear launch several times slower.
+    @testset "bounds check branches once" begin
+        B = KernelAbstractions.zeros(backend, Float32, 5, 6, 7, 3)
+        kernel = codegen_scale_cartesian(backend, 16)
+        @test @filecheck begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_scale_cartesian"
+            @check "br i1"
+            @check_not "br i1"
+            @check "ret void"
+            @device_code_llvm debuginfo = :none kernel(B, ndrange = size(B))
+            KernelAbstractions.synchronize(backend)
+        end
+
+        C = KernelAbstractions.zeros(backend, Float32, 5, 6, 7)
+        @test @filecheck begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_scale_cartesian"
+            @check "br i1"
+            @check_not "br i1"
+            @check "ret void"
+            @device_code_llvm debuginfo = :none kernel(C, ndrange = size(C))
+            KernelAbstractions.synchronize(backend)
+        end
+    end
+
+    # A 64-bit primitive type that the backend doesn't shuffle natively uses its native 64-bit
+    # shuffle (`__spirv_GroupNonUniformShuffle` mangled for an `i64` value is `...jmj`, for an
+    # `i32` value `...jjj`), rather than being split into two 32-bit words.
+    @testset "shuffles of other primitive types" begin
+        A = KernelAbstractions.zeros(backend, UInt64, 32)
+        @test @filecheck implicit_check_not = "GroupNonUniformShufflejjj" begin
+            @check "define spir_kernel void @{{.*}}gpu_codegen_shfl_bits64"
+            @check "GroupNonUniformShufflejmj"
+            @check_not "GroupNonUniformShuffle"
+            @check "ret void"
+            @device_code_llvm debuginfo = :none codegen_shfl_bits64(backend, 32)(A, ndrange = 32)
             KernelAbstractions.synchronize(backend)
         end
     end

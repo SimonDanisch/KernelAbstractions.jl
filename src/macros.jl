@@ -36,6 +36,7 @@ function __kernel(expr, __source__::LineNumberNode, __module__::Module, force_in
             if arg.args[1] === Symbol("@Const")
                 # arg.args[2] is a LineInfo node
                 args[i] = arg.args[3] # strip @Const
+                isexpr(args[i], :...) && error("`@Const` cannot be applied to varargs")
                 constargs[i] = true
                 continue
             end
@@ -45,6 +46,9 @@ function __kernel(expr, __source__::LineNumberNode, __module__::Module, force_in
 
     def_gpu = deepcopy(def)
     def_gpu[:name] = gpu_name = Symbol(:gpu_, name)
+    # a kernel returns `nothing` anyway, but a `ConstArgs` query returns its mask
+    delete!(def_gpu, :rtype)
+    forwarders = default_forwarders!(def_gpu, gpu_name, constargs)
     transform_gpu!(def_gpu, constargs, force_inbounds, unsafe_indices)
     if generated
         # Turn the kernel into a generated function: the transformed body is
@@ -70,6 +74,16 @@ function __kernel(expr, __source__::LineNumberNode, __module__::Module, force_in
     end
     gpu_function = combinedef(def_gpu)
 
+    # Properties of the kernel are methods of its function, rather than of a function of
+    # KernelAbstractions, so that a kernel can also be defined in a local scope. Like the
+    # constructors, they are defined with the first method of the kernel, since a method can't
+    # be overwritten during precompilation.
+    queries = Any[]
+    if find_collective(def[:body])
+        # see `uses_collectives`
+        push!(queries, :($gpu_name(::$CollectivesQuery) = true))
+    end
+
     # create constructor functions
     _name = Symbol(:_, name)
     constructors = quote
@@ -81,11 +95,12 @@ function __kernel(expr, __source__::LineNumberNode, __module__::Module, force_in
             $name(dev, size) = $_name(dev, $StaticSize(size), $DynamicSize())
             $name(dev, size, range) = $_name(dev, $StaticSize(size), $StaticSize(range))
             $name(dev, size::$_Size, range::$_Size) = $_name(dev, size, range)
+            $(queries...)
         end
     end
     constructors = relocate_lines(constructors, __source__)
 
-    return Expr(:block, esc(gpu_function), esc(constructors))
+    return Expr(:block, esc(gpu_function), esc(forwarders), esc(constructors))
 end
 
 """
@@ -94,14 +109,13 @@ end
 Marker type a `generated=true` kernel returns when its generator failed, carrying the
 error message in its type parameter. A kernel that returns this shows up in the
 `KernelError` GPUCompiler raises for kernels that return a value, which is the only
-channel through which a failure at generation time can be reported.
+channel through which a failure at generation time can be reported. The type prints
+as `GeneratedKernelError{Symbol("message")}`.
 """
 struct GeneratedKernelError{Msg} end
+# Overloading `show` on the type for nicer output would invalidate thousands of
+# `show(::IO, ::Type)` callers when the package loads.
 GeneratedKernelError(msg::AbstractString) = GeneratedKernelError{Symbol(msg)}()
-
-function Base.show(io::IO, ::Type{GeneratedKernelError{Msg}}) where {Msg}
-    return print(io, "KernelAbstractions.GeneratedKernelError(", repr(String(Msg)), ")")
-end
 
 # The left-hand side of a short-form method definition, `f(x) = ...`, possibly
 # wrapped in `where` clauses and a return type annotation: `f(x)::T where {T} = ...`.
@@ -164,18 +178,69 @@ function generated_error_body(err)
     return :(return $(GeneratedKernelError(msg)))
 end
 
-# The easy case, transform the function for GPU execution
-# - mark constant arguments by applying `constify`.
-function transform_gpu!(def, constargs, force_inbounds, unsafe_indices)
-    let_constargs = Expr[]
-    for (i, arg) in enumerate(def[:args])
-        if constargs[i]
-            push!(let_constargs, :($arg = $constify($arg)))
-        end
+# the answer of a kernel method to a `ConstArgs` query
+constargs_mask(constargs) = any(constargs) ? :(Val($(Tuple(constargs)))) : :nothing
+
+whereparam_name(p) = isexpr(p, :<:) || isexpr(p, :>:) ? p.args[1] : isexpr(p, :comparison) ? p.args[3] : p
+
+function uses(ex, name)
+    found = false
+    postwalk(x -> (found |= x === name; x), ex)
+    return found
+end
+
+# The methods for the arities that default arguments allow, which Julia would otherwise
+# generate itself. Like those, each supplies the next default, so that a default can refer to
+# the ones before it, but these first answer `ConstArgs` queries, so that a query doesn't
+# evaluate the defaults on the host. Strips the defaults from `def`.
+function default_forwarders!(def, gpu_name, constargs)
+    args = def[:args]
+    first_default = findfirst(arg -> isexpr(arg, :kw), args)
+    first_default === nothing && return Expr(:block)
+    nfixed = count(arg -> !isexpr(arg, :...), args)
+    # the forwarders pass on their arguments, so they need names
+    named = map(args) do arg
+        arg = isexpr(arg, :kw) ? arg.args[1] : arg
+        return isexpr(arg, :(::)) && length(arg.args) == 1 ? :($(gensym())::$(arg.args[1])) : arg
     end
-    pushfirst!(def[:args], :__ctx__)
+    argname(arg) = isexpr(arg, :(::)) ? arg.args[1] : arg
+    whereparams = collect(Base.get(def, :whereparams, ()))
+    forwarders = map((first_default - 1):(nfixed - 1)) do n
+        kept = named[1:n]
+        # Julia warns about static parameters that a method doesn't use
+        used = filter(p -> any(arg -> uses(arg, whereparam_name(p)), kept), whereparams)
+        while true
+            bounds = filter(p -> !(p in used) && any(q -> uses(q, whereparam_name(p)), used), whereparams)
+            isempty(bounds) && break
+            append!(used, bounds)
+        end
+        default = args[n + 1].args[2]
+        fdef = Dict{Symbol, Any}(
+            :name => gpu_name,
+            :args => Any[:(__ctx__::Union{$CompilerMetadata, $ConstArgs}), kept...],
+            :kwargs => Any[],
+            :whereparams => filter(in(used), whereparams),
+            :body => quote
+                __ctx__ isa $ConstArgs && return $(constargs_mask(constargs[1:n]))
+                # as in the methods Julia generates: referring to the function by name
+                # would capture it when it's a closure
+                return var"#self#"(__ctx__, $(map(argname, kept)...), $default)
+            end,
+        )
+        return combinedef(fdef)
+    end
+    def[:args] = map(arg -> isexpr(arg, :kw) ? arg.args[1] : arg, args)
+    return Expr(:block, forwarders...)
+end
+
+# The easy case, transform the function for GPU execution
+# - answer which arguments are marked `@Const` (see `ConstArgs`)
+function transform_gpu!(def, constargs, force_inbounds, unsafe_indices)
+    # typed, so that the queries of `@kernel` (e.g. `uses_collectives`) never match the kernel
+    def[:args] = Any[:(__ctx__::Union{$CompilerMetadata, $ConstArgs}), def[:args]...]
     # `Any[]`, since `split` hands back `LineNumberNode`s alongside `Expr`s
     new_stmts = Any[]
+    push!(new_stmts, :(__ctx__ isa $ConstArgs && return $(constargs_mask(constargs))))
     body = MacroTools.flatten(def[:body])
     if !unsafe_indices
         push!(new_stmts, :(__active_lane__ = $__validindex(__ctx__)))
@@ -192,11 +257,7 @@ function transform_gpu!(def, constargs, force_inbounds, unsafe_indices)
         push!(new_stmts, Expr(:inbounds, :pop))
     end
     push!(new_stmts, :(return nothing))
-    def[:body] = Expr(
-        :let,
-        Expr(:block, let_constargs...),
-        Expr(:block, new_stmts...),
-    )
+    def[:body] = Expr(:block, new_stmts...)
     return
 end
 
@@ -244,10 +305,21 @@ function is_scope_construct(expr::Expr)
     # expr.head === :let
 end
 
+function find_collective(stmt)
+    result = Ref(false)
+    postwalk(stmt) do expr
+        result[] |= is_collective(expr)
+        expr
+    end
+    return result[]
+end
+
+# Whether `stmt` contains a `@synchronize`, or a collective like `@groupreduce` that all
+# work-items of the workgroup have to reach as well.
 function find_sync(stmt)
     result = Ref(false)
     postwalk(stmt) do expr
-        result[] |= is_sync(expr)
+        result[] |= is_sync(expr) || is_collective(expr)
         expr
     end
     return result[]
@@ -279,6 +351,17 @@ function split(stmts)
             continue
         end
 
+        if is_collective_stmt(stmt)
+            # executed by all work-items, the padding ones contribute the neutral element
+            loop = WorkgroupLoop(current, allocations, false, nothing)
+            push!(new_stmts, emit(loop))
+            allocations = Any[]
+            current = Any[]
+            take_line!(new_stmts)
+            push!(new_stmts, mask_collective(stmt))
+            continue
+        end
+
         has_sync = find_sync(stmt)
         if has_sync
             loop = WorkgroupLoop(current, allocations, is_sync(stmt), line)
@@ -298,6 +381,7 @@ function split(stmts)
             recurse(x) = x
             function recurse(expr::Expr)
                 expr = unblock_lines(expr)
+                is_collective(expr) && collective_error(expr)
                 if expr.head in (:if, :elseif) && find_sync(expr)
                     return split_branches(expr, recurse)
                 elseif is_scope_construct(expr) && any(find_sync, expr.args)

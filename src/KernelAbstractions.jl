@@ -19,8 +19,8 @@ using KernelInterface: KernelInterface, Backend, get_backend, functional, synchr
 import KernelInterface as KI
 export KernelInterface
 
-# `GPU` is deprecated in 0.10:  and backends ends now subtype `Backend` directly. Keep the name working for code written
-# against 0.9, both `x::GPU` and `struct MyBackend <: GPU`.
+# `GPU` is deprecated in 0.10, and backends now subtype `Backend` directly. Keep the name
+# working for code written against 0.9, both `x::GPU` and `struct MyBackend <: GPU`.
 Base.@deprecate_binding GPU Backend
 
 """
@@ -42,6 +42,8 @@ and then invoked on the arguments.
 - [`@uniform`](@ref)
 - [`@synchronize`](@ref)
 - [`@print`](@ref)
+- [`@groupreduce`](@ref)
+- [`@groupscan`](@ref)
 
 # Kernel constructor
 
@@ -83,7 +85,7 @@ end
 
 This allows for the following configurations:
 
-1. `cpu={true, false}`: **Deprecated** in KernelAbstractions 0.11; this option is ignored.
+1. `cpu={true, false}`: **Deprecated** in KernelAbstractions 0.10; this option is ignored.
 2. `inbounds={false, true}`: Enables a forced `@inbounds` macro around the function definition in the case the user is using too many `@inbounds` already in their kernel. Note that this can lead to incorrect results, crashes, etc and is fundamentally unsafe. Be careful!
 3. `unsafe_indices={false, true}`: Disables the implicit validation of indices, users must avoid `@index(Global)`.
 4. `generated={false, true}`: Turns the kernel into a [generated function](https://docs.julialang.org/en/v1/manual/metaprogramming/#Generated-functions), see *Generated* below.
@@ -154,6 +156,11 @@ end
 `@Const` is an argument annotiation that asserts that the memory reference
 by `A` is both not written to as part of the kernel and that it does not alias
 any other memory in the kernel.
+
+The kernel receives such an argument with the backend's read-only array type, so a type
+annotation on it has to accept that type, e.g., `@Const(A::AbstractArray{T})`. Which
+arguments are read-only is determined by the kernel method the arguments select before
+that, so kernel methods should not dispatch on the read-only type.
 
 !!! danger
     Violating those constraints will lead to arbitrary behaviour.
@@ -496,16 +503,21 @@ Adapt.adapt_storage(::Backend, x)
 
 constify(arg) = adapt(ConstAdaptor(), arg)
 
-# `constify` runs inside the kernel, where wrappers must be rebuilt without re-validating
-# them: Adapt.jl's rules for these wrappers go through constructors whose error paths build
-# strings, which does not compile for GPUs. Adapting only replaces the parent array, so the
-# existing fields remain valid.
-Adapt.adapt_structure(to::ConstAdaptor, A::Base.ReshapedArray) =
-    Base.ReshapedArray(adapt(to, parent(A)), size(A), A.mi)
-@eval function Adapt.adapt_structure(to::ConstAdaptor, A::PermutedDimsArray{T, N, perm, iperm}) where {T, N, perm, iperm}
-    P = adapt(to, parent(A))
-    return $(Expr(:new, :(PermutedDimsArray{eltype(P), N, perm, iperm, typeof(P)}), :P))
+# A `@Const` argument is wrapped in a `ConstArg` when launching the kernel, so that the
+# backend's argument conversion constifies it right after converting it. That keeps Adapt.jl's
+# rules, which rebuild wrappers through validating constructors, out of device code, and
+# leaves converting (and tracking) the argument itself to the backend.
+struct ConstArg{T}
+    x::T
 end
+Adapt.adapt_structure(to, arg::ConstArg) = constify(adapt(to, arg.x))
+
+# Calling a kernel function with `ConstArgs()` instead of its context, on the host, returns
+# which of its arguments are marked `@Const`: `Val(mask)`, with a `Bool` per argument, or
+# `nothing` if none are. `@kernel` checks for it at the top of every kernel method, so that
+# the answer comes from the method the converted arguments dispatch to. For the actual
+# context, the check is folded away.
+struct ConstArgs end
 
 include("nditeration.jl")
 using .NDIteration
@@ -673,6 +685,7 @@ function __workitems_iterspace end
 end
 
 include("macros.jl")
+include("groupreduction.jl")
 include("spawn.jl")
 include("foreach_index.jl")
 
@@ -746,7 +759,7 @@ end
 
 # CPU backend
 include("pocl/pocl.jl")
-using .POCL
+using .POCL: POCL, POCLBackend
 export POCLBackend
 
 """
@@ -754,6 +767,14 @@ export POCLBackend
 
 CPU backend that compiles kernels to OpenCL via [POCL](https://portablecl.org/) and executes
 them on the host. This is the concrete type behind the [`CPU`](@ref) alias.
+
+!!! warning "Sub-group operations"
+    PoCL implements sub-group operations (shuffles, votes, and the collectives built on
+    them) with barriers across the whole work-group, so it doesn't support independent
+    sub-groups (`KernelInterface.supports_independent_subgroups` is `false`): all sub-groups
+    of a work-group have to execute the same sub-group operations, in the same order, e.g.
+    not in a loop whose trip count depends on the sub-group, or in a branch that only some
+    sub-groups take. Otherwise, results are wrong.
 """
 POCLBackend
 

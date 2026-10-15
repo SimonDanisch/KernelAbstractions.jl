@@ -17,7 +17,10 @@ struct Session
     device::cl.Device
     context::cl.Context
     # querying the device allocates, so cache the limits that every launch needs
-    limits::@NamedTuple{max_work_group_size::Int, max_work_group_dims::NTuple{3, Int}, sub_group_size::Int}
+    limits::@NamedTuple{
+        max_work_group_size::Int, max_work_group_dims::NTuple{3, Int}, sub_group_size::Int,
+        compute_units::Int,
+    }
 end
 
 function Session()
@@ -34,14 +37,17 @@ function Session()
     context = cl.Context(device)
 
     sizes = device.max_work_item_size
-    # POCL can technically support any sub-group size; prefer the common GPU ones
-    sg_sizes = device.sub_group_sizes
+    # POCL can technically support any sub-group size; prefer the common GPU ones, and only
+    # widths of up to 64, so that `KI.sub_group_ballot` (a `UInt64` mask) covers every lane
+    sg_sizes = filter(<=(64), device.sub_group_sizes)
     common = filter(in(sg_sizes), [32, 64, 16, sg_sizes...])
     limits = (;
         max_work_group_size = Int(device.max_work_group_size),
         max_work_group_dims = ntuple(d -> d <= length(sizes) ? sizes[d] : 1, 3),
         # 0 if the device has no sub-groups
         sub_group_size = isempty(common) ? 0 : first(common),
+        # the threads PoCL runs work-groups on
+        compute_units = Int(device.max_compute_units),
     )
 
     return Session(platform, device, context, limits)
@@ -90,7 +96,10 @@ function queue()
 end
 
 using GPUCompiler
-using LLVM, LLVM.IR, LLVM.Build, LLVM.Interop
+using LLVM, LLVM.Build, LLVM.Interop
+# not all of LLVM.IR, whose `context` would clash with ours
+using LLVM.IR: BasicBlock, ConstantArray, ConstantInt, DILocation, GlobalVariable, LLVMType,
+    MDNode, MD_invariant_load, MD_tbaa, MemoryEffects, StringAttribute, Value
 using SPIRV_LLVM_Backend_jll, SPIRV_Tools_jll
 using Adapt
 
@@ -110,6 +119,7 @@ include("device/array.jl")
 include("device/quirks.jl")
 include("device/runtime.jl")
 include("device/random.jl")
+include("device/shuffle.jl")
 
 include("compiler/compilation.jl")
 include("compiler/execution.jl")

@@ -8,15 +8,27 @@
 ###
 
 """
-    mkcontext(kernel::Kernel, ndrange, iterspace, [launch])
+    mkcontext(kernel::Kernel, ndrange, iterspace, [launch]; subgroups = nothing)
 
 The hidden context argument for launching `kernel` over `ndrange`, partitioned as
-`iterspace`, with the launch configuration `launch` (see [`select_launch`](@ref)).
+`iterspace`, with the launch configuration `launch` (see [`select_launch`](@ref)) and the
+backend's sub-group capabilities `subgroups` (see [`kernel_subgroups`](@ref)).
 """
 mkcontext(kernel::Kernel, _ndrange, iterspace) =
     CompilerMetadata{ndrange(kernel), DynamicCheck}(_ndrange, iterspace)
-mkcontext(kernel::Kernel, _ndrange, iterspace, launch) =
-    CompilerMetadata{ndrange(kernel), DynamicCheck}(_ndrange, iterspace; launch)
+mkcontext(kernel::Kernel, _ndrange, iterspace, launch; subgroups = nothing) =
+    CompilerMetadata{ndrange(kernel), DynamicCheck}(_ndrange, iterspace; launch, subgroups)
+
+"""
+    kernel_subgroups(kernel::Kernel)
+
+The sub-group capabilities of the backend of `kernel` that its work-group collectives can
+use, a [`SubgroupCapabilities`](@ref), or `nothing` if the backend has none, or if the kernel
+doesn't use collectives (which doesn't depend on the backend, so that launching other
+kernels doesn't query it).
+"""
+kernel_subgroups(kernel::Kernel) =
+    uses_collectives(kernel.f) ? subgroup_capabilities(backend(kernel)) : nothing
 mkcontext(kernel::Kernel, I, _ndrange, iterspace, ::Dynamic) where {Dynamic} =
     CompilerMetadata{ndrange(kernel), Dynamic}(I, _ndrange, iterspace)
 
@@ -88,12 +100,13 @@ function launch_tuple(obj::Kernel, args::Tuple; ndrange = nothing, workgroupsize
     # nothing to launch (or compile) for an empty ndrange
     any(iszero, size(blocks(iterspace))) && return nothing
 
-    # launch on an N-d grid, computing indices in 32 bits, if possible. this doesn't depend
-    # on the tuned workgroup size, so the context (and thus the kernel) doesn't either.
+    # launch on an N-d grid, computing indices in a narrow type, if possible. this doesn't
+    # depend on the tuned workgroup size, so the context (and thus the kernel) doesn't either.
     launch = select_launch(obj, workgroupsize, iterspace)
-    if launch === NDLaunch{Int32}()
+    T = narrow_index_type(backend(obj))
+    if launch === NDLaunch{T}()
         # the common case, specialized statically
-        launch_kernel(obj, NDLaunch{Int32}(), ndrange, workgroupsize, iterspace, args)
+        launch_kernel(obj, NDLaunch{T}(), ndrange, workgroupsize, iterspace, args)
     else
         # the other modes are rare: hide the callee from inference, so that it doesn't
         # analyze the whole launch chain for each of them when compiling every kernel
@@ -103,18 +116,27 @@ function launch_tuple(obj::Kernel, args::Tuple; ndrange = nothing, workgroupsize
 end
 
 function launch_kernel(obj::Kernel, launch, ndrange, _workgroupsize, iterspace, args::Tuple)
+    # a constant `nothing` for kernels without collectives; for kernels with, the call below
+    # is a function barrier that makes the rest of the launch type stable
+    subgroups = kernel_subgroups(obj)
+    launch_kernel(obj, launch, subgroups, ndrange, _workgroupsize, iterspace, args)
+    return nothing
+end
+
+function launch_kernel(obj::Kernel, launch, subgroups, ndrange, _workgroupsize, iterspace, args::Tuple)
     b = backend(obj)
 
     # this might not be the final context, since we may tune the workgroupsize
-    ctx = mkcontext(obj, ndrange, iterspace, launch)
-    kernel = compile(obj, ctx, args)
+    ctx = mkcontext(obj, ndrange, iterspace, launch; subgroups)
+    args, tt = prepare_arguments(b, obj.f, ctx, args)
+    kernel = KI.kernel_function(b, obj.f, tt; compiler_options(obj)...)
 
     # tune the workgroup size, keeping the context type (and thus the kernel) the same
     if workgroupsize(obj) <: DynamicSize && _workgroupsize === nothing
         range = something(ndrange, static_ndrange(obj))
         threads = KI.launch_configuration(kernel; nitems = saturated_prod(extents(range))).workgroupsize
         iterspace, _ = partition(obj, ndrange, launch_workgroupsize(b, launch, threads, range))
-        ctx = mkcontext(obj, ndrange, iterspace, launch)
+        ctx = mkcontext(obj, ndrange, iterspace, launch; subgroups)
     end
 
     # the geometry is valid by construction, except for the kernel's limits
@@ -130,19 +152,45 @@ function launch_kernel(obj::Kernel, launch, ndrange, _workgroupsize, iterspace, 
     return nothing
 end
 
-@inline function compile(obj::Kernel, ctx, args::Tuple)
-    b = backend(obj)
-    tt = argument_types(b, ctx, args)
-    return KI.kernel_function(b, obj.f, tt; compiler_options(obj)...)
-end
-
 # The helpers below avoid splatting the arguments, and `map`, which isn't type stable for 32
 # or more elements.
 
-# `Tuple{map(x -> Core.Typeof(KI.argconvert(backend, x)), (ctx, args...))...}`
-@inline @generated function argument_types(backend, ctx, args::Tuple)
-    types = (:(Core.Typeof(KI.argconvert(backend, args[$i]))) for i in 1:fieldcount(args))
-    return :(Tuple{Core.Typeof(KI.argconvert(backend, ctx)), $(types...)})
+# Wrap the arguments the kernel marks `@Const` in a `ConstArg`, and return them together
+# with the types of the converted arguments, which the kernel is compiled for. Converting a
+# `ConstArg` constifies the converted argument, so each argument only needs to be converted
+# once, to find the kernel method's `@Const` mask and to compute its type.
+@inline @generated function prepare_arguments(backend, f, ctx, args::Tuple)
+    n = fieldcount(args)
+    converted = [Symbol(:arg, i) for i in 1:n]
+    conversions = (:($(converted[i]) = KI.argconvert(backend, args[$i])) for i in 1:n)
+    return quote
+        converted_ctx = KI.argconvert(backend, ctx)
+        $(conversions...)
+        mask = f(ConstArgs(), $(converted...))
+        return mark_constargs(mask, args),
+            argument_types(mask, converted_ctx, ($(converted...),))
+    end
+end
+
+# a kernel with varargs can have more arguments than its mask
+is_constarg(mask, i) = i <= length(mask) && mask[i]
+
+# no argument is marked, or the generator of a generated kernel failed, which compiling it
+# reports
+mark_constargs(_, args::Tuple) = args
+@inline @generated function mark_constargs(::Val{mask}, args::Tuple) where {mask}
+    marked = (is_constarg(mask, i) ? :(ConstArg(args[$i])) : :(args[$i]) for i in 1:fieldcount(args))
+    return :(($(marked...),))
+end
+
+# `Tuple{map(Core.Typeof, (ctx, args...))...}`, with the `@Const` arguments constified
+@inline @generated function argument_types(mask, ctx, args::Tuple)
+    marked = mask <: Val ? mask.parameters[1] : ()
+    types = (
+        is_constarg(marked, i) ? :(Core.Typeof(constify(args[$i]))) : :(Core.Typeof(args[$i]))
+            for i in 1:fieldcount(args)
+    )
+    return :(Tuple{Core.Typeof(ctx), $(types...)})
 end
 
 # `(ctx, args...)`

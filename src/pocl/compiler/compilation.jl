@@ -173,12 +173,18 @@ keyword arguments. Besides those of `CompilerConfig` (`kernel`, `name`, `always_
   compilation fail or crash the driver's compiler, while disabling them relies on integer
   compare-and-swap for the fallback.
 - `extensions`: SPIR-V extensions to enable, as a `--spirv-ext` specifier (e.g.
-  `"+SPV_KHR_expect_assume"`), in addition to those the atomics need. `nothing`, the
-  default, enables no others.
+  `"+SPV_KHR_expect_assume"`), in addition to those the atomics need, to
+  `SPV_KHR_no_integer_wrap_decoration`, and to `SPV_INTEL_subgroups` on devices with
+  `cl_intel_subgroups` (for the vector shuffles of packed structs). `nothing`, the default,
+  enables no others.
 
 Other keyword arguments are passed on to `SPIRVCompilerTarget`.
 """
 function compiler_config end
+
+# `SPV_KHR_no_integer_wrap_decoration` carries the `nuw`/`nsw` flags of integer arithmetic,
+# e.g. of the index computations, over to PoCL (#868)
+const default_extensions = "+SPV_KHR_no_integer_wrap_decoration"
 
 # cache of compiler configurations, per device (but additionally configurable via kwargs)
 const _toolchain = Ref{Any}()
@@ -209,9 +215,16 @@ end
         error("$sub_group_size is not a valid sub-group size for this device.")
     end
 
+    # the vector shuffles of `KI.shfl_word_tuple` (see `POCLKernels`); `SPV_INTEL_subgroups`
+    # is only declared by modules that use it
+    if "cl_intel_subgroups" in dev.extensions
+        extensions = extensions === nothing ? "+SPV_INTEL_subgroups" : "+SPV_INTEL_subgroups,$extensions"
+    end
+
     # create GPUCompiler objects
     target = SPIRVCompilerTarget(;
-        supports_fp16, supports_fp64, atomics, extensions = something(extensions, ""),
+        supports_fp16, supports_fp64, atomics,
+        extensions = join(filter(!isempty, [default_extensions, something(extensions, "")]), ","),
         validate = true, kwargs...
     )
     params = OpenCLCompilerParams(; sub_group_size)
