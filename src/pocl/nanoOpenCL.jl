@@ -8,7 +8,9 @@ using GPUToolbox: GPUToolbox, @gcsafe_ccall, cooperative_wait
 
 using Printf
 
-const libopencl = pocl_standalone_jll.libpocl
+# PoCL isn't built for every platform Julia runs on (e.g., 32-bit Windows). the package has
+# to load there anyway; `Session` reports the missing library when the back-end is used.
+const libopencl = pocl_standalone_jll.is_available() ? pocl_standalone_jll.libpocl : ""
 
 """
     @checked function foo(...)
@@ -424,7 +426,8 @@ end
     throw(CLError(res))
 end
 
-function check(f)
+# inlined, so that `Ref`s passed to API calls in `f` can be allocated on the stack
+@inline function check(f)
     res = f()
 
     if res != CL_SUCCESS
@@ -1353,8 +1356,9 @@ function enqueue_kernel(
         if length(local_work_size) != work_dim
             throw(ArgumentError("global_work_size and local_work_size have differing dims"))
         end
+        # inlined, so that `ret_event` can be allocated on the stack
         ret_event = Ref{cl_event}()
-        clEnqueueNDRangeKernel(
+        @inline clEnqueueNDRangeKernel(
             queue(), k, cl_uint(work_dim),
             work_size(global_work_size), work_size(local_work_size), ret_event
         )
