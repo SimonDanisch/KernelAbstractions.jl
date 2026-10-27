@@ -1,8 +1,7 @@
 # The graphics stage intrinsics a shader body calls.
 #
-# Beside `device.jl` and `raytracing.jl`, for the reason those two are here:
-# a device-side name that a COMPILER lowers belongs under everything that
-# compiles or runs a shader.
+# Beside `device.jl`, for the reason it is here: a device-side name that a
+# COMPILER lowers belongs under everything that compiles or runs a shader.
 #
 # These were declared in Mantle and defined AGAIN in Lava, with a bridge in
 # `MantleVulkanExt` — `Mantle.$f() = Lava.$f()` — that existed only because Lava

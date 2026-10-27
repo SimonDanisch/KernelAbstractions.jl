@@ -33,7 +33,6 @@ include("topology.jl")
 # — and because a backend cannot override a name declared in a package that
 # depends on IT. See the headers of both files.
 include("graphics.jl")
-include("raytracing.jl")
 # The mesh pipeline, after `graphics.jl`: its emitter is what a geometry body
 # emits through, and the native lowering of that reaches the geometry stage
 # intrinsics declared there.
