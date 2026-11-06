@@ -92,7 +92,10 @@ function __kernel(expr, __source__::LineNumberNode, __module__::Module, force_in
     # create constructor functions
     _name = Symbol(:_, name)
     constructors = quote
-        if $(name isa Symbol ? :(!@isdefined($name)) : true)
+        # A reload can remove methods while retaining the function binding.
+        # Restore constructors then, while avoiding overwrites for overloads
+        # of a kernel whose constructors are still present during precompilation.
+        if $(name isa Symbol ? :(!@isdefined($name) || !hasmethod($name, Tuple{Any})) : true)
             function $_name(dev::Dev, sz::S, range::NDRange) where {Dev, S <: $_Size, NDRange <: $_Size}
                 return $construct(dev, sz, range, $gpu_name)
             end

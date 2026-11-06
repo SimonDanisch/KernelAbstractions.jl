@@ -7,6 +7,11 @@ include("linenumbers.jl")
 include("coverage.jl")
 include("testsuite.jl")
 include("codegen.jl")
+include("kernel_redefinition.jl")
+
+@testset "Kernel redefinition" begin
+    KernelRedefinition.kernel_redefinition_testsuite()
+end
 
 @testset "Quality assurance" begin
     quality_assurance_testsuite()
