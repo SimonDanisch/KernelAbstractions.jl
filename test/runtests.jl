@@ -922,6 +922,36 @@ end
     @test KernelAbstractions.select_launch(kernel, wgs, iterspace) === KernelAbstractions.NDLaunch{Int}()
 end
 
+@testset "POCL N-d work-group sizes" begin
+    # tuned work-groups shrink to divisors of the ndrange where possible, avoiding partial groups
+    wgs(ndrange) = KernelAbstractions.launch_workgroupsize(
+        CPU(), KernelAbstractions.NDLaunch{Int}(), 4096, ndrange
+    )
+    # (searching the work-group counts)
+    @test wgs((126, 126, 126)) == (126, 21, 1)
+    @test wgs((100, 100)) == (100, 25)
+    @test wgs((5000, 10)) == (2500, 1)
+    # (searching the sizes)
+    @test wgs((1024, 1002)) == (1024, 3)
+    @test wgs((64, 64, 64)) == (64, 64, 1)
+    # each dimension keeps at least half its size, or shrinks to a quarter without a divisor
+    @test wgs((127, 127, 127)) == (127, 8, 1)
+    @test wgs((1024, 1001)) == (1024, 1)
+    @test wgs((100003,)) == (1024,)
+    @test wgs((0, 7)) == (1, 7)
+
+    # an explicit workgroup size is kept
+    @kernel function groupsize!(A)
+        if @index(Global, Linear) == 1
+            A[1], A[2] = @groupsize()
+        end
+    end
+    A = zeros(Int, 2)
+    groupsize!(CPU())(A; ndrange = (126, 126), workgroupsize = (126, 32))
+    KernelAbstractions.synchronize(CPU())
+    @test A == [126, 32]
+end
+
 @kernel function fill_index!(A)
     I = @index(Global, Linear)
     @inbounds A[I] = I
@@ -931,6 +961,10 @@ end
     # workgroup sizes are validated against the kernel's limits
     limit = KernelAbstractions.KI.max_work_group_size(CPU())
     @test_throws ArgumentError fill_index!(CPU())(zeros(Int, 2limit); ndrange = 2limit, workgroupsize = 2limit)
+    # report the total-size limit even when linearization puts all work-items in the
+    # first dimension
+    n = limit ÷ 64 + 1
+    @test_throws "work-items" fill_index!(CPU(), (64, n))(zeros(Int, 128n); ndrange = (64, n, 2))
 
     # iteration spaces with more work-items than an `Int` can count are rejected, instead
     # of launching nothing because the number of workgroups overflowed
