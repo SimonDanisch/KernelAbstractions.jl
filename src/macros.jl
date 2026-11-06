@@ -72,6 +72,11 @@ function __kernel(expr, __source__::LineNumberNode, __module__::Module, force_in
         end
         def_gpu[:body] = Expr(:if, Expr(:generated), body, Expr(:meta, :generated_only))
     end
+    # Julia takes a method's location from the first `LineNumberNode` of its body, and only
+    # tracks coverage of methods whose file is tracked. The transformed body starts with
+    # generated statements, which would leave the kernel at `none:0` and thus untracked under
+    # `--code-coverage=@path`.
+    def_gpu[:body] = Expr(:block, __source__, def_gpu[:body])
     gpu_function = combinedef(def_gpu)
 
     # Properties of the kernel are methods of its function, rather than of a function of
@@ -183,18 +188,16 @@ constargs_mask(constargs) = any(constargs) ? :(Val($(Tuple(constargs)))) : :noth
 
 whereparam_name(p) = isexpr(p, :<:) || isexpr(p, :>:) ? p.args[1] : isexpr(p, :comparison) ? p.args[3] : p
 
-function uses(ex, name)
-    found = false
-    postwalk(x -> (found |= x === name; x), ex)
-    return found
-end
+uses(ex, name) = ex === name || (ex isa Expr && any(arg -> uses(arg, name), ex.args))
 
 # The methods for the arities that default arguments allow, which Julia would otherwise
 # generate itself. Like those, each supplies the next default, so that a default can refer to
 # the ones before it, but these first answer `ConstArgs` queries, so that a query doesn't
 # evaluate the defaults on the host. Strips the defaults from `def`.
 function default_forwarders!(def, gpu_name, constargs)
-    args = def[:args]
+    # `def` holds values of any type; assert the vector, so that the reductions below don't
+    # depend on generic iteration, which packages invalidate by extending it
+    args = def[:args]::Vector
     first_default = findfirst(arg -> isexpr(arg, :kw), args)
     first_default === nothing && return Expr(:block)
     nfixed = count(arg -> !isexpr(arg, :...), args)
@@ -286,7 +289,7 @@ is_sync(expr) = is_macrocall(expr, Symbol("@synchronize"))
 
 # Split the branches of an `if` that contains a `@synchronize`. The conditions run on all
 # lanes, but every branch needs to be guarded, including those without a `@synchronize`.
-function split_branches(expr, recurse)
+function split_branches(expr::Expr, recurse)
     cond = expr.args[1]
     find_sync(cond) && (cond = recurse(cond))
     branches = map(expr.args[2:end]) do branch
@@ -325,6 +328,29 @@ function find_sync(stmt)
     return result[]
 end
 
+# Flush the pending `LineNumberNode` into `stmts`, returning `nothing` to clear it.
+function take_line!(stmts, line)
+    line === nothing || push!(stmts, line)
+    return nothing
+end
+
+# Recurse into scope constructs
+# TODO: This currently implements hard scoping
+#       probably need to implement soft scoping
+#       by not deepcopying the environment.
+split_scopes(x) = x
+function split_scopes(expr::Expr)
+    expr = unblock_lines(expr)
+    is_collective(expr) && collective_error(expr)
+    if expr.head in (:if, :elseif) && find_sync(expr)
+        return split_branches(expr, split_scopes)
+    elseif is_scope_construct(expr) && any(find_sync, expr.args)
+        return Expr(expr.head, split(expr.args)...)
+    else
+        return Expr(expr.head, map(split_scopes, expr.args)...)
+    end
+end
+
 function split(stmts)
     # 1. Split the code into blocks separated by `@synchronize`
 
@@ -337,13 +363,6 @@ function split(stmts)
     # information over eagerly we attach it to whichever list the statement
     # lands in. Otherwise hoisted allocations lose their source location.
     line = nothing
-    # Flush the pending `LineNumberNode` into `stmts`.
-    function take_line!(stmts)
-        line === nothing && return
-        push!(stmts, line)
-        line = nothing
-        return
-    end
 
     for stmt in stmts
         if stmt isa LineNumberNode
@@ -357,7 +376,7 @@ function split(stmts)
             push!(new_stmts, emit(loop))
             allocations = Any[]
             current = Any[]
-            take_line!(new_stmts)
+            line = take_line!(new_stmts, line)
             push!(new_stmts, mask_collective(stmt))
             continue
         end
@@ -374,40 +393,24 @@ function split(stmts)
                 continue
             end
 
-            # Recurse into scope constructs
-            # TODO: This currently implements hard scoping
-            #       probably need to implement soft scoping
-            #       by not deepcopying the environment.
-            recurse(x) = x
-            function recurse(expr::Expr)
-                expr = unblock_lines(expr)
-                is_collective(expr) && collective_error(expr)
-                if expr.head in (:if, :elseif) && find_sync(expr)
-                    return split_branches(expr, recurse)
-                elseif is_scope_construct(expr) && any(find_sync, expr.args)
-                    return Expr(expr.head, split(expr.args)...)
-                else
-                    return Expr(expr.head, map(recurse, expr.args)...)
-                end
-            end
-            take_line!(new_stmts)
-            push!(new_stmts, recurse(stmt))
+            line = take_line!(new_stmts, line)
+            push!(new_stmts, split_scopes(stmt))
             continue
         end
 
         if is_macrocall(stmt, Symbol("@uniform"))
-            take_line!(allocations)
+            line = take_line!(allocations, line)
             push!(allocations, stmt)
             continue
         elseif is_macrocall(stmt, Symbol("@private")) && length(stmt.args) == 3 &&
                 isexpr(stmt.args[3], :(=))
             # `@private lhs = rhs`
-            take_line!(allocations)
+            line = take_line!(allocations, line)
             push!(allocations, stmt.args[3])
             continue
         elseif @capture(stmt, lhs_ = rhs_ | (vs__, lhs_ = rhs_))
             if is_macrocall(rhs, Symbol("@localmem")) || is_macrocall(rhs, Symbol("@uniform"))
-                take_line!(allocations)
+                line = take_line!(allocations, line)
                 push!(allocations, stmt)
                 continue
             elseif is_macrocall(rhs, Symbol("@private")) && length(rhs.args) == 4
@@ -418,13 +421,13 @@ function split(stmts)
                     dims = (dims,)
                 end
                 alloc = :($Scratchpad(__ctx__, $T, Val($dims)))
-                take_line!(allocations)
+                line = take_line!(allocations, line)
                 push!(allocations, :($lhs = $alloc))
                 continue
             end
         end
 
-        take_line!(current)
+        line = take_line!(current, line)
         push!(current, stmt)
     end
 

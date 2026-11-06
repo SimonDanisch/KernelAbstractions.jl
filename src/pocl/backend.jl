@@ -2,7 +2,7 @@ module POCLKernels
 
 using ..POCL
 using ..POCL: @device_override, cl, method_table
-using ..POCL: device, device_limits, clconvert, clfunction
+using ..POCL: device_limits, clconvert, clfunction
 
 using SPIRV_LLVM_Backend_jll, SPIRV_Tools_jll
 
@@ -102,6 +102,35 @@ end
 # `unsafe_wrap`) are the user's responsibility, as documented for `CPU`.
 KI.allocate(::POCLBackend, ::Type{T}, dims::Tuple; unified::Bool = false) where {T} = Array{T}(undef, dims)
 
+# Initialized
+
+KA.@kernel function fill_kernel(A, x)
+    I = KA.@index(Global)
+    @inbounds A[I] = x
+end
+
+# Filling or copying into an array with a kernel first-touches its pages from PoCL's threads,
+# which spreads them over the threads' memory domains instead of placing all of them in the
+# calling thread's (see the NUMA example). Below 1 MiB, the launch overhead makes that up to
+# several times slower than writing from the host, while there are too few pages for
+# placement to matter.
+const KERNEL_FILL_BYTES = 1 << 20
+
+# arrays of bits unions, whose element type isn't `isbitstype`, are filled from the host
+function fill_initialized!(backend::POCLBackend, A::Array{T}, x) where {T}
+    if isbitstype(T) && sizeof(A) >= KERNEL_FILL_BYTES
+        fill_kernel(backend)(A, x; ndrange = length(A))
+    else
+        fill!(A, x)
+    end
+    return A
+end
+
+KI.zeros(backend::POCLBackend, ::Type{T}, dims::Tuple; kwargs...) where {T} =
+    fill_initialized!(backend, KI.allocate(backend, T, dims; kwargs...), zero(T))
+KI.ones(backend::POCLBackend, ::Type{T}, dims::Tuple; kwargs...) where {T} =
+    fill_initialized!(backend, KI.allocate(backend, T, dims; kwargs...), one(T))
+
 #  Adapt.jl's `Array` rule converts every `AbstractArray` leaf; `isbits` arrays (ranges, view indices)
 # which we want to keep as they are.
 Adapt.adapt_storage(::POCLBackend, x::AbstractArray) = isbits(x) ? x : Adapt.adapt(Array, x)
@@ -120,24 +149,24 @@ KA.@kernel function copy_kernel(A, @Const(B))
 end
 
 
+# small copies, copies of bits unions and overlapping copies are done from the host
 function KI.copyto!(backend::POCLBackend, A, B)
     length(A) == length(B) ||
         throw(ArgumentError("Arrays must match in length, got $(length(A)) and $(length(B))"))
-    if KI.get_backend(A) == KI.get_backend(B) && KI.get_backend(A) isa POCLBackend
-        if Base.mightalias(A, B)
-            error("Arrays may not alias")
-        end
-        kernel = copy_kernel(backend)
-        kernel(A, B, ndrange = length(A))
-        return A
+    T = eltype(A)
+    if KI.get_backend(A) == KI.get_backend(B) && KI.get_backend(A) isa POCLBackend &&
+            isbitstype(T) && length(A) * sizeof(T) >= KERNEL_FILL_BYTES && !Base.mightalias(A, B)
+        copy_kernel(backend)(A, B, ndrange = length(A))
     else
         Base.copyto!(A, B)
-        return A
     end
+    return A
 end
 
 KI.functional(::POCLBackend) = true
 KA.pagelock!(::POCLBackend, x) = nothing
+# its work-items are iterations of a loop, which is faster than dividing for any group size
+KA.fold_threshold(::POCLBackend) = 1
 
 KI.get_backend(::Array) = POCLBackend()
 
@@ -148,7 +177,7 @@ KI.get_backend(::Array) = POCLBackend()
 ## must synchronize upon kernel launch and can't rely on synchronization upon
 ## array access. Therefore, `synchronize` is a no-op.
 KI.synchronize(::POCLBackend) = nothing
-KI.supports_float64(::POCLBackend) = "cl_khr_fp64" in device().extensions
+KI.supports_float64(::POCLBackend) = device_limits().fp64
 KI.supports_unified(::POCLBackend) = true
 KI.supports_atomics(::POCLBackend) = true
 
@@ -164,11 +193,17 @@ struct POCLKernel{K, F}
     f::F
 end
 
-function KI.kernel_function(backend::POCLBackend, f::F, tt::TT = Tuple{}; name = nothing, kwargs...) where {F, TT}
+function KI.kernel_function(backend::POCLBackend, f::F, tt::TT = Tuple{}; kwargs...) where {F, TT}
+    return KA.kernel_function_as(backend, f, tt, tt; kwargs...)
+end
+
+Base.@nospecializeinfer function KA.kernel_function_as(
+        backend::POCLBackend, f::F, @nospecialize(compiled_tt::Type), tt::TT; name = nothing, kwargs...
+    ) where {F, TT}
     # the sub-group width defaults to the one `KI.sub_group_size` reports. it is determined
     # when creating the compiler configuration, since passing it here would make the keyword
     # arguments' type depend on the device, and the call to `clfunction` dynamic.
-    kernel = clfunction(clconvert(f), tt; name, kwargs...)
+    kernel = clfunction(clconvert(f), tt, compiled_tt; name, kwargs...)
     kern = POCLKernel(kernel, f)
     return KI.Kernel{POCLBackend, typeof(kern)}(backend, kern)
 end
@@ -184,10 +219,8 @@ function KI.launch(obj::KI.Kernel{POCLBackend}, groups::Dims{3}, items::Dims{3},
     return nothing
 end
 
-function KI.max_work_group_size(kernel::KI.Kernel{<:POCLBackend})::Int
-    wginfo = cl.work_group_info(kernel.kern.kernel.fun, device())
-    return Int(wginfo.size)
-end
+KI.max_work_group_size(kernel::KI.Kernel{<:POCLBackend})::Int =
+    kernel.kern.kernel.fun.work_group_size
 KI.max_work_group_size(::POCLBackend)::Int = device_limits().max_work_group_size
 KI.max_work_group_dims(::POCLBackend)::NTuple{3, Int} = device_limits().max_work_group_dims
 # the grid is only limited by the size of `size_t`
@@ -200,16 +233,28 @@ KI.multiprocessor_count(::POCLBackend)::Int = device_limits().compute_units
 # single thread, so split it into about as many work-groups as there are threads, as long as
 # the work-groups stay large enough to vectorize. this assumes that the work is balanced
 # across the work-items.
-function KI.launch_configuration(
-        kernel::KI.Kernel{<:POCLBackend}; nitems::Union{Integer, Nothing} = nothing,
-        max_work_group_size::Integer = typemax(Int)
-    )
-    wginfo = cl.work_group_info(kernel.kern.kernel.fun, device())
-    max_items = min(wginfo.size, max_work_group_size)
+KI.launch_configuration(
+    kernel::KI.Kernel{<:POCLBackend}; nitems::Union{Integer, Nothing} = nothing,
+    max_work_group_size::Integer = typemax(Int)
+) = (; workgroupsize = launch_workgroupsize(kernel.kern.kernel.fun, nitems, max_work_group_size))
+
+# kept out of `KI.launch_configuration`, which is compiled for every kernel
+@noinline function launch_workgroupsize(kernel::cl.Kernel, nitems, max_work_group_size)
+    max_items = min(kernel.work_group_size, max_work_group_size)
     items = cpu_workgroupsize(
-        nitems, device_limits().compute_units, max_items, wginfo.prefered_size_multiple
+        nitems, device_limits().compute_units, max_items, kernel.preferred_work_group_size_multiple
     )
-    return (; workgroupsize = Int(items))
+    return Int(items)
+end
+
+# the workgroup size `KI.launch_configuration` tunes for kernels with the device's limits,
+# which is what PoCL kernels report, unless their estimated stack use limits their size
+function KA.expected_workgroupsize(::POCLBackend, nitems)
+    limits = device_limits()
+    return cpu_workgroupsize(
+        nitems, limits.compute_units, limits.max_work_group_size,
+        limits.preferred_work_group_size_multiple
+    )
 end
 
 # PoCL's own choice when a launch doesn't give a local size (`pocl_default_local_size_optimizer`
@@ -251,8 +296,8 @@ const ShuffleTypes = Union{SPIRVIntrinsics.gentypes...}
 
 function KI.supports_shuffle(backend::POCLBackend, ::Type{T}) where {T <: ShuffleTypes}
     KI.supports_subgroups(backend) || return false
-    T === Float64 && return "cl_khr_fp64" in device().extensions
-    T === Float16 && return "cl_khr_fp16" in device().extensions
+    T === Float64 && return device_limits().fp64
+    T === Float16 && return device_limits().fp16
     return true
 end
 

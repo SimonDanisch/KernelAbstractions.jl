@@ -181,14 +181,20 @@ function launch_and_wait(kernel::AbstractKernel, args::Tuple; kwargs...)
     info[] = ExceptionInfo_st()
     GC.@preserve args info begin
         event = launch_tuple(kernel, args, Base.unsafe_convert(Ptr{ExceptionInfo_st}, info); kwargs...)
-        try
-            wait(event)
-        finally
-            cl.clReleaseEvent(event)
-        end
+        wait_for_kernel(event, info)
+    end
+    return nothing
+end
+
+# kept out of `launch_and_wait`, which is compiled for every kernel
+@noinline function wait_for_kernel(event::cl.Event, info::Base.RefValue{ExceptionInfo_st})
+    try
+        wait(event)
+    finally
+        cl.clReleaseEvent(event)
     end
     info[].status == 0 || throw(KernelException(device()))
-    return nothing
+    return
 end
 
 @inline launch_tuple(
@@ -196,33 +202,30 @@ end
     global_size = (1,), local_size = nothing
 ) = launch_converted(kernel, args, exception_info, global_size, local_size)
 
+# the call's tuple type and argument expressions for `launch_converted`. (on vectors, so that
+# it compiles once for all argument counts.)
+function kernel_call_arguments(@nospecialize(F), @nospecialize(TT), nargs::Int)
+    params = Any[F, TT.parameters...]   # Base.signature_type with a function type
+    exprs = Any[:(kernel.f); Any[:(clconvert(args[$i])) for i in 1:nargs]]
+    call_t = Type[KernelState]
+    call_args = Any[
+        :(KernelState(kernel.rng_state ? Base.rand(UInt32) : UInt32(0), UInt64(UInt(exception_info)))),
+    ]
+    for (dt, ex) in zip(params, exprs)
+        # filter out ghost arguments that shouldn't be passed
+        pass_arg(dt) || continue
+        # replace non-isbits arguments (they should be unused, or compilation would have
+        # failed)
+        push!(call_t, isbitstype(dt) ? dt : Ptr{Any})
+        push!(call_args, isbitstype(dt) ? ex : :C_NULL)
+    end
+    return Base.to_tuple_type(call_t), call_args
+end
+
 @inline @generated function launch_converted(
         kernel::AbstractKernel{F, TT}, args::Tuple, exception_info, global_size, local_size
     ) where {F, TT}
-    sig = Tuple{F, TT.parameters...}    # Base.signature_type with a function type
-    args = (:(kernel.f), (:(clconvert(args[$i])) for i in 1:fieldcount(args))...)
-
-    # filter out ghost arguments that shouldn't be passed
-    to_pass = map(pass_arg, sig.parameters)
-    call_t = Type[x[1] for x in zip(sig.parameters, to_pass) if x[2]]
-    call_args = Union{Expr, Symbol}[x[1] for x in zip(args, to_pass)            if x[2]]
-
-    # replace non-isbits arguments (they should be unused, or compilation would have failed)
-    for (i, dt) in enumerate(call_t)
-        if !isbitstype(dt)
-            call_t[i] = Ptr{Any}
-            call_args[i] = :C_NULL
-        end
-    end
-
-    pushfirst!(call_t, KernelState)
-    pushfirst!(
-        call_args,
-        :(KernelState(kernel.rng_state ? Base.rand(UInt32) : UInt32(0), UInt64(UInt(exception_info))))
-    )
-
-    # finalize types
-    call_tt = Base.to_tuple_type(call_t)
+    call_tt, call_args = kernel_call_arguments(F, TT, fieldcount(args))
 
     # the converted arguments only hold pointers to the arrays in `args`
     return quote
@@ -267,7 +270,38 @@ end
 
 const clfunction_lock = ReentrantLock()
 
-function clfunction(f::F, tt::TT = Tuple{}; kwargs...) where {F, TT}
+# `compiled_tt` are the argument types to compile the kernel for, if they aren't `tt`. they
+# may only differ in ways that don't change how the arguments are passed (e.g. in the type
+# parameters of a struct). it isn't specialized on, so that looking up either kernel is the
+# same code.
+Base.@nospecializeinfer function clfunction(
+        f::F, tt::TT = Tuple{}, @nospecialize(compiled_tt::Type) = tt; kwargs...
+    ) where {F, TT}
+    kw = values(kwargs)
+    # besides the signature, the kernel only depends on the session and the compiler options.
+    # the kernel compiled for other types has a key of another type, and thus a cache of its
+    # own: launches alternating between both kernels then find either on the fast path.
+    kernel, rng_state = if compiled_tt === tt
+        GPUCompiler.cached_lookup(Tuple{cl.Kernel, Bool}, F, tt, (context(), kw)) do
+            lookup_kernel(F, tt, kw)
+        end
+    else
+        # (wrapped, so that the types of the key and the lookup don't depend on it)
+        compiled = Some{Type}(compiled_tt)
+        GPUCompiler.cached_lookup(Tuple{cl.Kernel, Bool}, F, tt, (context(), kw, compiled)) do
+            lookup_kernel(F, something(compiled), kw)
+        end
+    end
+    # not cached: that would keep every callable that was ever launched alive
+    return HostKernel{F, tt}(f, kernel, rng_state)
+end
+
+# Returns the `cl.Kernel` for `F` and `tt` on the session's context, and whether it uses
+# the device-side RNG. Nothing in here depends on the types of the kernel or its arguments,
+# so it is inferred and compiled once, rather than for every new kernel.
+@noinline Base.@nospecializeinfer function lookup_kernel(
+        @nospecialize(F::Type), @nospecialize(tt::Type), @nospecialize(kwargs::NamedTuple)
+    )
     Base.@lock clfunction_lock begin
         config = compiler_config(device(); kwargs...)::OpenCLCompilerConfig
         source = methodinstance(F, tt)
@@ -300,8 +334,7 @@ function clfunction(f::F, tt::TT = Tuple{}; kwargs...) where {F, TT}
             cached
         end
 
-        # not cached: that would keep every callable that was ever launched alive
-        return HostKernel{F, tt}(f, kernel, res.device_rng)
+        return kernel::cl.Kernel, res.device_rng
     end
 end
 
@@ -316,7 +349,7 @@ end
 # observes cached kernels without recompiling them.
 # Keep this specialized so the caller can avoid boxing `CompilerJob`. Its type parameters
 # only identify the target and compiler parameters, so this is bounded per back-end rather
-# than specialized for every kernel; `@noinline` keeps the body out of each `clfunction`.
+# than specialized for every kernel.
 @noinline function compile_or_lookup(job::CompilerJob)::OpenCLResults
     GPUCompiler.run_compile_hook(job)
     res = GPUCompiler.cached_results(OpenCLResults, job)

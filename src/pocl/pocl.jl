@@ -16,10 +16,11 @@ struct Session
     platform::cl.Platform
     device::cl.Device
     context::cl.Context
-    # querying the device allocates, so cache the limits that every launch needs
+    # querying the device allocates, so cache what launches need
     limits::@NamedTuple{
         max_work_group_size::Int, max_work_group_dims::NTuple{3, Int}, sub_group_size::Int,
-        compute_units::Int,
+        compute_units::Int, preferred_work_group_size_multiple::Int,
+        fp16::Bool, fp64::Bool,
     }
 end
 
@@ -27,8 +28,8 @@ end
 # POCL can technically support any sub-group size; prefer the common GPU ones, and only
 # widths of up to 64, so that `KI.sub_group_ballot` (a `UInt64` mask) covers every lane.
 function default_sub_group_size(device::cl.Device)
-    sg_sizes = filter(<=(64), device.sub_group_sizes)
-    common = filter(in(sg_sizes), [32, 64, 16, sg_sizes...])
+    sg_sizes = filter(<=(64), device.sub_group_sizes::Tuple{Vararg{Int}})
+    common = filter(in(sg_sizes), Int[32, 64, 16, sg_sizes...])
     return isempty(common) ? nothing : first(common)
 end
 
@@ -48,6 +49,7 @@ function Session()
     context = cl.Context(device)
 
     sizes = device.max_work_item_size
+    extensions = device.extensions
     sub_group_size = default_sub_group_size(device)
     limits = (;
         max_work_group_size = Int(device.max_work_group_size),
@@ -56,6 +58,11 @@ function Session()
         sub_group_size = something(sub_group_size, 0),
         # the threads PoCL runs work-groups on
         compute_units = Int(device.max_compute_units),
+        # what kernels report, unless PoCL chose another for them
+        preferred_work_group_size_multiple = Int(device.preferred_work_group_size_multiple),
+        # collectives check these on every launch
+        fp16 = "cl_khr_fp16" in extensions,
+        fp64 = "cl_khr_fp64" in extensions,
     )
 
     return Session(platform, device, context, limits)
@@ -119,7 +126,16 @@ SPIRVIntrinsics.@reexport_public
 Base.Experimental.@MethodTable(method_table)
 
 import Core: LLVMPtr
+import GPUToolbox
 import UnsafeAtomics
+
+# the size of an element in an array, which for isbits unions includes padding to their
+# alignment. on Julia 1.10, `Base.aligned_sizeof` isn't constant-folded in device code.
+@static if VERSION < v"1.11"
+    @generated aligned_sizeof(::Type{T}) where {T} = :($(Base.aligned_sizeof(T)))
+else
+    import Base: aligned_sizeof
+end
 
 # the device code comes first: the compiler's generated functions use its types, and a
 # generator only sees the bindings that existed when it was defined
@@ -133,8 +149,28 @@ include("compiler/compilation.jl")
 include("compiler/execution.jl")
 include("compiler/reflection.jl")
 
+# the selector byte of element `i` of an array of isbits unions, which `Array` stores past
+# the data of its memory. that memory can be longer than the array, which can also start
+# at an offset into it.
+@static if VERSION >= v"1.11.0-DEV.753"
+    function typetagdata(a::Array, i = 1)
+        # for memory of isbits unions, the reference holds the offset of the data in elements
+        ptr_or_offset = Int(a.ref.ptr_or_offset)
+        return @ccall(jl_genericmemory_typetagdata(a.ref.mem::Any)::Ptr{UInt8}) + ptr_or_offset + i - 1
+    end
+else
+    typetagdata(a::Array, i = 1) = ccall(:jl_array_typetagdata, Ptr{UInt8}, (Any,), a) + i - 1
+end
+
 function Adapt.adapt_storage(to::KernelAdaptor, xs::Array{T, N}) where {T, N}
-    return CLDeviceArray{T, N, AS.CrossWorkgroup}(size(xs), reinterpret(LLVMPtr{T, AS.CrossWorkgroup}, pointer(xs)))
+    ptr = pointer(xs)
+    # device arrays find their selector bytes `maxsize` bytes past their data
+    maxsize = if Base.isbitsunion(T)
+        Int(UInt(typetagdata(xs)) - UInt(ptr))
+    else
+        length(xs) * aligned_sizeof(T)
+    end
+    return CLDeviceArray{T, N, AS.CrossWorkgroup}(size(xs), reinterpret(LLVMPtr{T, AS.CrossWorkgroup}, ptr), maxsize)
 end
 
 import KernelInterface

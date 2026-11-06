@@ -75,13 +75,13 @@ end
         fadd_f64_global = true, fadd_f64_local = true
     )
     @test POCL.compiler_config(dev).target.atomics == atomics
-    # explicitly requested extensions are kept, in addition to the default ones and the one
-    # for vector shuffles
-    @test POCL.compiler_config(dev).target.extensions ==
-        "+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups"
+    # explicitly requested extensions are kept, in addition to the default ones and the ones
+    # for vector shuffles and (with a PoCL that supports it) bfloat16
+    device_extensions = "+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups" *
+        ("SPV_KHR_bfloat16" in dev.spirv_extensions ? ",+SPV_KHR_bfloat16" : "")
+    @test POCL.compiler_config(dev).target.extensions == device_extensions
     config = POCL.compiler_config(dev; extensions = "+SPV_KHR_expect_assume")
-    @test config.target.extensions ==
-        "+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups,+SPV_KHR_expect_assume"
+    @test config.target.extensions == device_extensions * ",+SPV_KHR_expect_assume"
     @test config.target.atomics == atomics
     @test POCL.compiler_config(dev; extensions = nothing).target ==
         POCL.compiler_config(dev).target
@@ -218,6 +218,22 @@ end
     @test A == ref
 end
 
+# Base compares `Rational`s by multiplying out their denominators in 128-bit integers, which
+# the SPIR-V back-end cannot lower
+@testset "POCL comparisons with Rationals" begin
+    @kernel function rational_compare!(out, a, b)
+        I = @index(Global, Linear)
+        @inbounds out[I] = a[I] < b[I]
+    end
+    a = [1 // 4, 1 // 2, 2 // 3, -1 // 3]
+    for b in ([1 // 3, 1 // 2, 1 // 2, -1 // 2], [3, 0, 1, 0], [0.3, 0.6, 0.5, -0.5])
+        out = zeros(Bool, length(a))
+        rational_compare!(CPU())(out, a, b; ndrange = length(a))
+        synchronize(CPU())
+        @test out == (a .< b)
+    end
+end
+
 @testset "POCL reinterpret" begin
     @kernel function reinterpret_copy!(out, a)
         I = @index(Global, Linear)
@@ -237,6 +253,12 @@ end
         reinterpret_copy!(CPU())(out, Union{Int8, UInt8}[Int8(-1)]; ndrange = 1)
         synchronize(CPU())
     end
+end
+
+@testset "POCL show of device arrays" begin
+    ptr = reinterpret(Core.LLVMPtr{Float32, POCL.AS.CrossWorkgroup}, UInt(0x10))
+    @test sprint(show, POCL.CLDeviceArray((2, 3), ptr)) == "2×3 device array at $ptr"
+    @test sprint(show, POCL.CLDeviceArray((4,), ptr)) == "4-element device array at $ptr"
 end
 
 # `@Const` arguments are constified by the launch, using the mask of the kernel method
@@ -285,6 +307,18 @@ end
     )
 end
 
+# the RNG state takes two UInt32s of local memory per sub-group
+@testset "POCL device RNG: local memory" begin
+    rng_kernel(A) = (A[POCL.get_global_id()] = rand(Float32); return)
+    A = zeros(Float32, 32)
+    kernel = POCL.clfunction(rng_kernel, Tuple{typeof(POCL.clconvert(A))})
+    @test kernel.rng_state
+    kernel(A; global_size = 32, local_size = 32)
+    num_sub_groups = POCL.cl.sub_group_info(kernel.fun, POCL.device(), Csize_t[32]).sub_group_count
+    local_mem = POCL.cl.work_group_info(kernel.fun, POCL.device()).local_mem_size
+    @test local_mem == 2 * sizeof(UInt32) * num_sub_groups
+end
+
 # `randn`/`randexp` for Float16 route through Random's table-free fallback, whose polar
 # transform overflows in Float16 and whose `log1p` isn't available for Float16 on the
 # device. The device overlays compute in Float32 and convert, so results stay finite.
@@ -307,6 +341,8 @@ if "cl_khr_fp16" in POCL.device().extensions
         @test all(isfinite, b)
     end
 end
+
+include("bfloat16.jl")
 
 # the sub-group width kernels are compiled for is the one `KI.sub_group_size` reports
 # (PoCL folds `get_max_sub_group_size` to that constant itself, see pocl/pocl#2375)
@@ -479,6 +515,12 @@ end
         mod.launch(kernel, B, n)
         @test allocated(mod.launch, kernel, B, n) == 0 skip = skip_wait
     end
+
+    # nor does checking what the device supports, which launches of collectives do
+    for T in (Float16, Float32, Float64)
+        @test allocated(KernelAbstractions.KernelInterface.supports_shuffle, CPU(), T) == 0
+    end
+    @test allocated(KernelAbstractions.supports_float64, CPU()) == 0
 end
 
 @testset "POCL exceptions" begin
@@ -583,6 +625,55 @@ end
     @test count() == n + 2
 end
 
+# `clfunction` reuses the kernel it returned last for a call site
+@testset "POCL kernel reuse" begin
+    mod = @eval module $(gensym())
+    import KernelAbstractions.POCL
+    @noinline helper(x) = x + 1
+    kernel(A, x::Number) = (A[1] = helper(x); return)
+    launch(A, x) = (POCL.@opencl kernel(A, x); A[1])
+    struct Constant
+        x::Int
+    end
+    (c::Constant)(A) = (A[1] = c.x; return)
+    launch_callable(f, A) = (POCL.@opencl f(A); A[1])
+    end
+
+    count() = POCL.compilations[]
+    launch(A, x) = Base.invokelatest(mod.launch, A, x)
+    A = zeros(Int, 1)
+    @test launch(A, 1) == 2
+    n = count()
+    @test launch(A, 2) == 3
+    @test count() == n
+
+    # defining unrelated methods changes the world, but not the kernel
+    @eval mod unrelated() = nothing
+    @test launch(A, 2) == 3
+    @test count() == n
+
+    # redefining a callee recompiles
+    @eval mod @noinline helper(x) = x + 10
+    @test launch(A, 2) == 12
+    @test count() == n + 1
+
+    # a more specific method of the kernel is used, although the code of the other one is
+    # still valid
+    world = Base.get_world_counter()
+    @eval mod kernel(A, x::Int) = (A[1] = -x; return)
+    @test launch(A, 2) == -2
+    @test count() == n + 2
+
+    # launches in an older world use the methods of that world
+    @test Base.invoke_in_world(world, mod.launch, A, 2) == 12
+    @test launch(A, 2) == -2
+    @test count() == n + 2
+
+    # callables of the same type are launched with their own values
+    @test Base.invokelatest(mod.launch_callable, mod.Constant(1), A) == 1
+    @test Base.invokelatest(mod.launch_callable, mod.Constant(2), A) == 2
+end
+
 @testset "POCL session" begin
     # in a fresh process, to check initialization, and with threads, which the tests
     # usually don't have
@@ -651,6 +742,141 @@ end
     end
 end
 
+struct ZeroOnePair
+    a::Int16
+    b::Float32
+end
+Base.zero(::Type{ZeroOnePair}) = ZeroOnePair(0, 0.0f0)
+Base.one(::Type{ZeroOnePair}) = ZeroOnePair(1, 1.0f0)
+
+# large arrays are filled with a kernel, small ones from the host
+@testset "POCL zeros/ones of large arrays" begin
+    threshold = POCL.POCLKernels.KERNEL_FILL_BYTES
+    for T in (Float32, Int8, ComplexF64, ZeroOnePair)
+        n = cld(threshold, sizeof(T)) + 3
+        for dims in ((n,), (cld(n, 7), 7), (1,))
+            Z = KernelAbstractions.zeros(POCLBackend(), T, dims)
+            @test Z isa Array{T, length(dims)} && size(Z) == dims
+            @test all(==(zero(T)), Z)
+
+            O = KernelAbstractions.ones(POCLBackend(), T, dims...)
+            @test O isa Array{T, length(dims)} && size(O) == dims
+            @test all(==(one(T)), O)
+        end
+    end
+end
+
+# large copies use a kernel, small ones the host, as do overlapping ones
+@testset "POCL copyto!" begin
+    threshold = POCL.POCLKernels.KERNEL_FILL_BYTES
+    values = (Float32 => Float32, Union{Missing, Int32} => i -> isodd(i) ? Int32(i) : missing)
+    for (T, value) in values
+        @testset "$T, $m elements" for m in (16, cld(threshold, 4) + 3)
+            x = T[value(i) for i in 1:m]
+            y = Array{T}(undef, m)
+            @test KernelAbstractions.copyto!(POCLBackend(), y, x) === y
+            @test isequal(y, x)
+
+            z = copy(x)
+            KernelAbstractions.copyto!(POCLBackend(), view(z, 2:m), view(z, 1:(m - 1)))
+            @test isequal(z, [x[1]; x[1:(m - 1)]])
+        end
+    end
+end
+
+# a struct with a union field is not isbits, but is stored inline with its own selector
+struct UnionField
+    x::Union{Int, Float32}
+end
+
+@kernel function bump_union!(x)
+    i = @index(Global)
+    val = x[i]
+    if val isa Int
+        x[i] = val + 1
+    end
+end
+
+@kernel function flip_union!(x)
+    i = @index(Global)
+    x[i] = x[i] === missing ? nothing : missing
+end
+
+@kernel function widen_union!(x)
+    i = @index(Global)
+    val = x[i]
+    if val isa NTuple{3, Int32}
+        x[i] = Int64(sum(val))
+    else
+        x[i] = (Int32(val), Int32(0), Int32(0))
+    end
+end
+
+@kernel function fill_union_field!(x)
+    i = @index(Global)
+    x[i] = i == 1 ? UnionField(1) : UnionField(2.0f0)
+end
+
+@kernel function reverse_union_local!(x)
+    i = @index(Local)
+    tmp = @localmem Union{Int64, NTuple{3, Int32}} (4,)
+    tmp[i] = x[i]
+    @synchronize
+    x[i] = tmp[5 - i]
+end
+
+# arrays of bits unions keep one selector byte per element past the data of their memory
+@testset "POCL kernels on bits-union arrays" begin
+    backend = POCLBackend()
+    bump!(x) = (bump_union!(backend)(x; ndrange = length(x)); synchronize(backend); x)
+
+    @test bump!(Union{Int, Nothing}[1, nothing, 3]) == [2, nothing, 4]
+    @test isequal(bump!(Union{Union{Missing, Nothing}, Int}[0, missing, nothing]), [1, missing, nothing])
+
+    # the memory of an array can be longer than it, or start before it
+    a = Union{Int, Nothing}[1, nothing, 3]
+    push!(a, 4)
+    sizehint!(a, 100)
+    @test bump!(a) == [2, nothing, 4, 5]
+    b = Union{Int, Nothing}[nothing, nothing, 1, nothing, 3]
+    popfirst!(b)
+    popfirst!(b)
+    @test bump!(b) == [2, nothing, 4]
+
+    # views index into their parent
+    c = Union{Int, Nothing}[nothing, nothing, 1, nothing, 3, 5]
+    bump!(view(c, 3:5))
+    @test c == [nothing, nothing, 2, nothing, 4, 5]
+    bump!(view(c, 1:2:5))
+    @test c == [nothing, nothing, 3, nothing, 5, 5]
+
+    # unions of singletons have no data, only selector bytes
+    h = Union{Nothing, Missing}[missing, nothing, nothing, missing]
+    popfirst!(h)
+    flip_union!(backend)(h; ndrange = 3)
+    synchronize(backend)
+    @test isequal(h, [missing, missing, nothing])
+
+    # the element size (12 bytes) is not a multiple of the alignment (8 bytes)
+    d = Union{Int64, NTuple{3, Int32}}[1, Int32.((2, 3, 4)), 5]
+    widen_union!(backend)(d; ndrange = 3)
+    synchronize(backend)
+    @test d == Union{Int64, NTuple{3, Int32}}[Int32.((1, 0, 0)), 9, Int32.((5, 0, 0))]
+
+    # a struct with a union field keeps its selector inside the element
+    e = UnionField[UnionField(0), UnionField(0)]
+    fill_union_field!(backend)(e; ndrange = 2)
+    synchronize(backend)
+    @test e == [UnionField(1), UnionField(2.0f0)]
+
+    # local memory is padded to the union's alignment, followed by the selector bytes
+    f = Union{Int64, NTuple{3, Int32}}[1, Int32.((2, 3, 4)), 5, Int32.((6, 7, 8))]
+    g = copy(f)
+    reverse_union_local!(backend, 4)(g; ndrange = 4)
+    synchronize(backend)
+    @test g == reverse(f)
+end
+
 # a mapping KernelAbstractions doesn't know, which the index functions have to go
 # through `expand`, `in` and `linear_index` for
 struct TransposedMapping end
@@ -684,6 +910,13 @@ end
     Testsuite.select_launch_testsuite()
 end
 
+@testset "select_launch on PoCL" begin
+    # tuned launches are folded for any number of work-items in the first three dimensions
+    kernel = mapped_indices!(CPU())
+    _, wgs, iterspace, _ = KernelAbstractions.launch_config(kernel, (1, 1, 1, 3000), nothing)
+    @test KernelAbstractions.select_launch(kernel, wgs, iterspace) === KernelAbstractions.NDLaunch{Int}()
+end
+
 @kernel function fill_index!(A)
     I = @index(Global, Linear)
     @inbounds A[I] = I
@@ -697,6 +930,96 @@ end
     # iteration spaces with more work-items than an `Int` can count are rejected, instead
     # of launching nothing because the number of workgroups overflowed
     @test_throws ArgumentError fill_index!(CPU())(zeros(Int, 1); ndrange = (2^22, 2^22, 2^22, 1), workgroupsize = 1)
+end
+
+# whether the launch runs a kernel that checks its indices
+@kernel function bounds_checked!(A)
+    I = @index(Global, Linear)
+    @inbounds A[I] = KernelAbstractions.__dynamic_checkbounds(__ctx__)
+end
+
+@kernel function tuned_bounds_checked!(A)
+    I = @index(Global, Linear)
+    @inbounds A[I] = KernelAbstractions.__dynamic_checkbounds(__ctx__)
+end
+
+@kernel function partial_bounds_checked!(A)
+    I = @index(Global, Linear)
+    @inbounds A[I] = KernelAbstractions.__dynamic_checkbounds(__ctx__)
+end
+
+# with a workgroup size limited by the kernel's stack use: the sign of `A` is whether it
+# checks its indices, the magnitude the size of its workgroups
+@kernel function stack_bounds_checked!(A, B, @Const(idx))
+    I = @index(Global, Linear)
+    tmp = @private Float32 (1000,)
+    for j in 1:1000
+        @inbounds tmp[j] = j
+    end
+    @inbounds B[I] = tmp[idx[I]]
+    items = prod(@groupsize())
+    @inbounds A[I] = KernelAbstractions.__dynamic_checkbounds(__ctx__) ? -items : items
+end
+
+@testset "POCL bounds checks" begin
+    function checked(kernel, shape; workgroupsize = nothing)
+        A = fill(-1, shape)
+        kernel(A; ndrange = shape, workgroupsize)
+        all(==(A[1]), A) || error("inconsistent bounds checks")
+        return Bool(A[1])
+    end
+
+    # a kernel without the bounds check runs launches without partial workgroups
+    @test !checked(bounds_checked!(CPU()), 64; workgroupsize = 16)
+    @test checked(bounds_checked!(CPU()), 60; workgroupsize = 16)
+    @test !checked(bounds_checked!(CPU()), (8, 6); workgroupsize = (4, 3))
+    @test checked(bounds_checked!(CPU()), (8, 6); workgroupsize = (4, 4))
+    @test !checked(bounds_checked!(CPU()), (4, 6, 8); workgroupsize = (2, 3, 4))
+    @test checked(bounds_checked!(CPU()), (4, 6, 9); workgroupsize = (2, 3, 4))
+    @test !checked(bounds_checked!(CPU(), 8), 16)
+    @test checked(bounds_checked!(CPU(), 8), 12)
+    # also with a tuned workgroup size, which is a power of two on PoCL, unless a single
+    # workgroup covers the ndrange (e.g. on a single thread). an odd ndrange larger than
+    # the largest workgroup needs partial workgroups, however many threads PoCL uses.
+    @test !checked(bounds_checked!(CPU()), 1024)
+    @test checked(bounds_checked!(CPU()), POCL.device_limits().max_work_group_size + 1)
+    @test !checked(bounds_checked!(CPU()), (64, 32))
+
+    # only the kernel that the launch needs is compiled
+    compilations = POCL.compilations[]
+    @test !checked(tuned_bounds_checked!(CPU()), 4096)
+    @test POCL.compilations[] == compilations + 1
+    @test checked(partial_bounds_checked!(CPU()), 4097)
+    @test POCL.compilations[] == compilations + 2
+
+    # the tuned workgroup size is predicted from the device's limits, which a kernel's can
+    # be smaller than: then, its workgroups may not cover the ndrange, and need the check
+    A, B, idx = zeros(Int, 4096), zeros(Float32, 4096), rand(1:1000, 4096)
+    stack_bounds_checked!(CPU())(A, B, idx; ndrange = length(A))
+    @test all(==(A[1]), A)
+    @test (A[1] < 0) == !iszero(length(A) % abs(A[1]))
+    @test B == idx
+end
+
+@kernel function muladd_kernel!(D, @Const(A), @Const(B), @Const(C))
+    i = @index(Global)
+    @inbounds D[i] = muladd(A[i], B[i], C[i])
+end
+
+@testset "POCL muladd" begin
+    for T in (Float32, Float64)
+        A, B, C = rand(T, 64), rand(T, 64), rand(T, 64)
+        D = similar(A)
+        muladd_kernel!(CPU())(D, A, B, C; ndrange = length(D))
+        @test D ≈ muladd.(A, B, C)
+
+        # on CPUs with hardware FMA, the multiplication is not rounded: subtracting the
+        # rounded product leaves its rounding error
+        a = one(T) + eps(T)
+        A, B, C = fill(a, 4), fill(a, 4), fill(-(a * a), 4)
+        muladd_kernel!(CPU())(D, A, B, C; ndrange = 4)
+        @test all(==(POCL.fast_fma() ? fma(a, a, -(a * a)) : zero(T)), D[1:4])
+    end
 end
 
 @testset "POCL workgroup size" begin
@@ -760,8 +1083,10 @@ end
     for launch in (nothing, KA.LinearLaunch{Int}(), KA.NDLaunch{Int}())
         function launcher(kernel, args...; ndrange, workgroupsize = nothing)
             ndrange, workgroupsize, iterspace, _ = KA.launch_config(kernel, ndrange, workgroupsize)
-            # an N-d launch is limited to three dimensions
-            l = launch isa KA.NDLaunch && ndims(iterspace) > 3 ? KA.LinearLaunch{Int}() : launch
+            # an N-d launch needs one work-item past the third dimension, as tuned workgroups have
+            fold = KA.workgroupsize(kernel) <: KA.DynamicSize && workgroupsize === nothing ||
+                all(==(1), size(KA.workitems(iterspace))[4:end])
+            l = launch isa KA.NDLaunch && !fold ? KA.LinearLaunch{Int}() : launch
             KernelAbstractions.launch_kernel(kernel, l, ndrange, workgroupsize, iterspace, args)
         end
         @testset "$launch" begin
@@ -798,6 +1123,34 @@ struct NewBackend <: KernelAbstractions.Backend end
     @test_throws ErrorException KernelAbstractions.priority!(backend, :middle)
 
     @test KernelAbstractions.functional(backend) === missing
+end
+
+# a GPU back-end, whose kernel type depends on the function and argument types
+struct StaticBackend <: KernelAbstractions.GPU end
+struct StaticKernel{F, TT} end
+const KI = KernelAbstractions.KernelInterface
+KI.argconvert(::StaticBackend, x) = x
+KI.kernel_function(b::StaticBackend, ::F, ::Type{TT}; kwargs...) where {F, TT} =
+    KI.Kernel{StaticBackend, StaticKernel{F, TT}}(b, StaticKernel{F, TT}())
+KI.launch(::KI.Kernel{StaticBackend}, groups, items, args) = nothing
+KI.max_work_group_size(::Union{StaticBackend, KI.Kernel{StaticBackend}}) = 1024
+KI.max_work_group_dims(::StaticBackend) = (1024, 1024, 64)
+KI.max_num_groups(::StaticBackend) = (2^31 - 1, 65535, 65535)
+KI.launch_configuration(::KI.Kernel{StaticBackend}; kwargs...) = (; workgroupsize = 256)
+@testset "Kernel type is inferred" begin
+    KA = KernelAbstractions
+    kernel = mapped_indices!(StaticBackend())
+    @testset "workgroupsize $ws" for ws in (nothing, 8)
+        ndrange, _, iterspace, _ = KA.launch_config(kernel, 10, ws)
+        tt = Tuple{
+            typeof(kernel), Nothing, Nothing, typeof(ndrange), typeof(ws), typeof(iterspace),
+            Tuple{Vector{Int}}, Bool,
+        }
+        ci, _ = only(code_typed(KA.launch_kernel, tt; optimize = false))
+        kernels = filter(T -> T !== Union{} && T <: KI.Kernel, map(Core.Compiler.widenconst, ci.ssavaluetypes))
+        @test !isempty(kernels)
+        @test all(isconcretetype, kernels)
+    end
 end
 
 @testset "Deprecated GPU alias" begin

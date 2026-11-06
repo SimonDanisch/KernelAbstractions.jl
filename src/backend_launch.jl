@@ -95,14 +95,23 @@ argconvert(kernel::Kernel{<:KI.Backend}, arg) = KI.argconvert(backend(kernel), a
 Core.kwcall(kwargs::NamedTuple, obj::Kernel{<:KI.Backend}, args::Vararg{Any, N}) where {N} =
     launch_tuple(obj, args; kwargs...)
 
+# strip singleton functions (like those of `@kernel`) to share launch code across kernels
+# with the same backend and static sizes. hooks can't dispatch on such a function's type;
+# callables with state keep theirs (see `test/launch.jl`).
+@inline sizes_only(obj::Kernel{B, WS, ND, F}) where {B, WS, ND, F} =
+    Base.issingletontype(F) ? similar(obj, nothing) : obj
+
 function launch_tuple(obj::Kernel, args::Tuple; ndrange = nothing, workgroupsize = nothing)
-    ndrange, workgroupsize, iterspace, dynamic = launch_config(obj, ndrange, workgroupsize)
+    setup = launch_setup(sizes_only(obj), ndrange, workgroupsize)
     # nothing to launch (or compile) for an empty ndrange
-    any(iszero, size(blocks(iterspace))) && return nothing
+    setup === nothing && return nothing
+    ndrange, workgroupsize, iterspace = setup
 
     # launch on an N-d grid, computing indices in a narrow type, if possible. this doesn't
     # depend on the tuned workgroup size, so the context (and thus the kernel) doesn't either.
-    launch = select_launch(obj, workgroupsize, iterspace)
+    # (not done by `launch_setup`: the launch mode isn't inferred concretely, so returning
+    # it would box the result)
+    launch = @noinline select_launch(sizes_only(obj), workgroupsize, iterspace)
     T = narrow_index_type(backend(obj))
     if launch === NDLaunch{T}()
         # the common case, specialized statically
@@ -115,27 +124,138 @@ function launch_tuple(obj::Kernel, args::Tuple; ndrange = nothing, workgroupsize
     return nothing
 end
 
+# The parts of the launch that don't depend on the arguments are kept out of
+# `launch_tuple` and `launch_kernel`, which are compiled for every kernel.
+
+# normalize the launch arguments, or return `nothing` if there is nothing to launch
+@noinline function launch_setup(obj::Kernel, ndrange, workgroupsize)
+    ndrange, workgroupsize, iterspace, dynamic = launch_config(obj, ndrange, workgroupsize)
+    any(iszero, size(blocks(iterspace))) && return nothing
+    return ndrange, workgroupsize, iterspace
+end
+
 function launch_kernel(obj::Kernel, launch, ndrange, _workgroupsize, iterspace, args::Tuple)
     # a constant `nothing` for kernels without collectives; for kernels with, the call below
     # is a function barrier that makes the rest of the launch type stable
     subgroups = kernel_subgroups(obj)
-    launch_kernel(obj, launch, subgroups, ndrange, _workgroupsize, iterspace, args)
+    launch_kernel(obj, launch, subgroups, ndrange, _workgroupsize, iterspace, args, false)
     return nothing
 end
 
-function launch_kernel(obj::Kernel, launch, subgroups, ndrange, _workgroupsize, iterspace, args::Tuple)
+function launch_kernel(
+        obj::Kernel, launch, subgroups, ndrange, _workgroupsize, iterspace, args::Tuple,
+        checked::Bool
+    )
     b = backend(obj)
 
     # this might not be the final context, since we may tune the workgroupsize
     ctx = mkcontext(obj, ndrange, iterspace, launch; subgroups)
-    args, tt = prepare_arguments(b, obj.f, ctx, args)
-    kernel = KI.kernel_function(b, obj.f, tt; compiler_options(obj)...)
+    kernel_args, tt = prepare_arguments(b, obj.f, ctx, args)
+
+    # on PoCL, a launch without a partial workgroup runs a kernel without the bounds check,
+    # which keeps PoCL's loop over the work-items free of control flow, and thus
+    # vectorizable without masking (or at all, on targets without masked memory accesses).
+    # elsewhere, the check is cheap and a second kernel would cost compile time. to only
+    # compile the kernel that the launch needs, a tuned workgroup size is predicted from the
+    # device's limits. the unchecked kernel is launched with the context of the checked one,
+    # which only differs in its type, so that the code launching or looking up either is
+    # compiled once.
+    tuned = workgroupsize(obj) <: DynamicSize && _workgroupsize === nothing
+    range = something(ndrange, static_ndrange(obj))
+    unchecked = !checked && skip_bounds_check(b) && expect_coverage(b, launch, range, iterspace, tuned)
+    kernel = if skip_bounds_check(b)
+        # hide the check type from inference, so that the lookup compiles once for both
+        compiled_tt = Base.compilerbarrier(:type, unchecked ? without_bounds_check(tt) : tt)::Type
+        kernel_function_as(b, obj.f, compiled_tt, tt; compiler_options(obj)...)
+    else
+        # infer the kernel's type, avoiding dynamic dispatch in the rest of the launch
+        KI.kernel_function(b, obj.f, tt; compiler_options(obj)...)
+    end
 
     # tune the workgroup size, keeping the context type (and thus the kernel) the same
-    if workgroupsize(obj) <: DynamicSize && _workgroupsize === nothing
+    threads = if tuned
+        KI.launch_configuration(kernel; nitems = saturated_prod(extents(range))).workgroupsize
+    else
+        nothing
+    end
+    ctx, groups, items = launch_geometry(sizes_only(obj), launch, subgroups, ndrange, iterspace, ctx, threads)
+
+    # the kernel's limits aren't the device's, and the workgroups tuned for them don't cover
+    # the ndrange: launch the checked kernel instead
+    if unchecked && tuned && !covers(range, ctx)
+        return launch_kernel(obj, launch, subgroups, ndrange, _workgroupsize, iterspace, args, true)
+    end
+
+    KI.check_work_group_size(kernel, items)
+    KI.launch(kernel, groups, items, prepend(ctx, kernel_args))
+    return nothing
+end
+
+# whether launches of `@kernel` kernels on `backend` skip the bounds check when the
+# workgroups cover the ndrange exactly, compiling a separate kernel for those launches.
+# those backends implement `kernel_function_as` and `expected_workgroupsize`.
+skip_bounds_check(backend) = backend isa POCL.POCLBackend
+
+"""
+    kernel_function_as(backend, f, compiled_tt, tt; kwargs...)
+
+`KI.kernel_function(backend, f, compiled_tt; kwargs...)`, as a kernel that is launched with
+arguments of the types `tt`, which only differ from `compiled_tt` in the type parameters of
+the context. Backends for which `skip_bounds_check` holds implement it, without
+specializing on `compiled_tt`.
+"""
+function kernel_function_as end
+
+"""
+    expected_workgroupsize(backend, nitems)
+
+The workgroup size that `KI.launch_configuration` normally tunes for a launch of `nitems`
+work-items, computed without a kernel. Only called if `skip_bounds_check(backend)`.
+"""
+function expected_workgroupsize end
+
+# the argument types `tt` of a launch, with `NoDynamicCheck` in the type of the context
+# (which `argconvert` doesn't change) instead of `DynamicCheck`. computed from the types, as
+# constructing the context takes more host code to compile for every kernel.
+@generated function without_bounds_check(::Type{TT}) where {TT <: Tuple}
+    C = TT.parameters[1]
+    @assert C <: CompilerMetadata && C.parameters[2] === DynamicCheck
+    params = Any[C.parameters...]
+    params[2] = NoDynamicCheck
+    return :($(Tuple{CompilerMetadata{params...}, TT.parameters[2:end]...}))
+end
+
+# whether the work-items of `iterspace` that are outside of the `range` (the ndrange) are
+# those of partial workgroups: the iteration space is one that `partition` creates (a custom
+# one may map work-items outside of the ndrange), over `CartesianIndices`
+bounded(range, iterspace) = builtin(iterspace) && cartesian(range) isa CartesianIndices
+
+# whether workgroups of `items` work-items, partitioning the `range`, which is `bounded`,
+# cover it exactly
+covers(range, items::Dims) = all(map((n, i) -> iszero(n % i), size(cartesian(range)), items))
+# (kept out of `launch_kernel`, which is compiled for every kernel)
+@noinline covers(range, ctx::CompilerMetadata) = covers(range, size(workitems(__iterspace(ctx))))
+
+# whether the workgroups of a launch over `range`, partitioned as `iterspace` or with a
+# `tuned` workgroup size, are expected to cover it exactly (see `bounded` and `covers`)
+@noinline function expect_coverage(b, launch, range, iterspace, tuned::Bool)
+    bounded(range, iterspace) || return false
+    items = if tuned
+        expected = expected_workgroupsize(b, saturated_prod(extents(range)))
+        launch_workgroupsize(b, launch, expected, range)
+    else
+        size(workitems(iterspace))
+    end
+    return covers(range, items)
+end
+
+# the context and launch geometry, re-partitioned for the tuned workgroup size `threads`
+@noinline function launch_geometry(
+        obj::Kernel, launch, subgroups, ndrange, iterspace, ctx, threads
+    )
+    if threads !== nothing
         range = something(ndrange, static_ndrange(obj))
-        threads = KI.launch_configuration(kernel; nitems = saturated_prod(extents(range))).workgroupsize
-        iterspace, _ = partition(obj, ndrange, launch_workgroupsize(b, launch, threads, range))
+        iterspace, _ = partition(obj, ndrange, launch_workgroupsize(backend(obj), launch, threads, range))
         ctx = mkcontext(obj, ndrange, iterspace, launch; subgroups)
     end
 
@@ -143,13 +263,11 @@ function launch_kernel(obj::Kernel, launch, subgroups, ndrange, _workgroupsize, 
     groups = size(blocks(iterspace))
     items = size(workitems(iterspace))
     if launch isa NDLaunch
-        groups, items = KI.pad3(groups), KI.pad3(items)
+        groups, items = KI.pad3(nd_grid(groups)), KI.pad3(nd_grid(items))
     else
         groups, items = (prod(groups), 1, 1), (prod(items), 1, 1)
     end
-    KI.check_work_group_size(kernel, items)
-    KI.launch(kernel, groups, items, prepend(ctx, args))
-    return nothing
+    return ctx, groups, items
 end
 
 # The helpers below avoid splatting the arguments, and `map`, which isn't type stable for 32

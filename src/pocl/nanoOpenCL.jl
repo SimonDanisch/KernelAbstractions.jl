@@ -390,6 +390,8 @@ const CL_BUILD_ERROR = -2
 
 const CL_BUILD_IN_PROGRESS = -3
 
+const CL_KERNEL_NUM_ARGS = 0x1191
+
 const CL_KERNEL_WORK_GROUP_SIZE = 0x11b0
 
 const CL_KERNEL_COMPILE_WORK_GROUP_SIZE = 0x11b1
@@ -417,6 +419,8 @@ const CL_KERNEL_EXEC_INFO_SVM_PTRS = 0x11b6
 const CL_KERNEL_EXEC_INFO_SVM_FINE_GRAIN_SYSTEM = 0x11b7
 
 const CL_DEVICE_SUB_GROUP_SIZES_INTEL = 0x4108
+
+const CL_DEVICE_SPIRV_EXTENSIONS_KHR = 0x12ba
 
 struct CLError <: Exception
     code::Cint
@@ -654,6 +658,15 @@ end
     @gcsafe_ccall libopencl.POclSetKernelArgSVMPointer(
         kernel::cl_kernel, arg_index::cl_uint,
         arg_value::Ptr{Cvoid}
+    )::cl_int
+end
+
+@checked function clGetKernelInfo(
+        kernel, param_name, param_value_size, param_value, param_value_size_ret
+    )
+    @gcsafe_ccall libopencl.POclGetKernelInfo(
+        kernel::cl_kernel, param_name::cl_uint, param_value_size::Csize_t,
+        param_value::Ptr{Cvoid}, param_value_size_ret::Ptr{Csize_t}
     )::cl_int
 end
 
@@ -932,9 +945,9 @@ end
     end
 
     # scalar values
-    @inline function get_scalar(prop, typ)
-        scalar = Ref{typ}()
-        clGetDeviceInfo(d, prop, sizeof(typ), scalar, C_NULL)
+    @inline function get_scalar(prop, ::Type{T}) where {T}
+        scalar = Ref{T}()
+        clGetDeviceInfo(d, prop, sizeof(T), scalar, C_NULL)
         return Int(scalar[])
     end
     if s === :vendor_id
@@ -963,6 +976,8 @@ end
         return get_scalar(CL_DEVICE_LOCAL_MEM_SIZE, cl_ulong)
     elseif s === :max_work_group_size
         return get_scalar(CL_DEVICE_MAX_WORK_GROUP_SIZE, Csize_t)
+    elseif s === :preferred_work_group_size_multiple
+        return get_scalar(CL_DEVICE_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, Csize_t)
     elseif s === :max_parameter_size
         return get_scalar(CL_DEVICE_MAX_PARAMETER_SIZE, Csize_t)
     elseif s === :profiling_timer_resolution
@@ -996,10 +1011,20 @@ end
         return String[string(s) for s in split(bs)]
     end
 
+    # cl_khr_spirv_queries: the SPIR-V extensions that modules may declare
+    if s == :spirv_extensions
+        "cl_khr_spirv_queries" in d.extensions::Vector{String} || return String[]
+        size = Ref{Csize_t}()
+        clGetDeviceInfo(d, CL_DEVICE_SPIRV_EXTENSIONS_KHR, 0, C_NULL, size)
+        result = Vector{Ptr{Cchar}}(undef, size[] ÷ sizeof(Ptr{Cchar}))
+        clGetDeviceInfo(d, CL_DEVICE_SPIRV_EXTENSIONS_KHR, sizeof(result), result, C_NULL)
+        return String[unsafe_string(ptr) for ptr in result]
+    end
+
     # cl_ext_float_atomics: per-precision bitfields of natively supported floating-point
     # atomic operations (zero when the device does not expose the extension)
     if s == :single_fp_atomic_capabilities || s == :double_fp_atomic_capabilities || s == :half_fp_atomic_capabilities
-        "cl_ext_float_atomics" in d.extensions || return zero(UInt64)
+        "cl_ext_float_atomics" in d.extensions::Vector{String} || return zero(UInt64)
         prop = s == :single_fp_atomic_capabilities ? CL_DEVICE_SINGLE_FP_ATOMIC_CAPABILITIES_EXT :
             s == :double_fp_atomic_capabilities ? CL_DEVICE_DOUBLE_FP_ATOMIC_CAPABILITIES_EXT :
             CL_DEVICE_HALF_FP_ATOMIC_CAPABILITIES_EXT
@@ -1032,7 +1057,7 @@ end
     end
 
     if s == :max_work_item_size
-        result = Vector{Csize_t}(undef, d.max_work_item_dims)
+        result = Vector{Csize_t}(undef, d.max_work_item_dims::Int)
         clGetDeviceInfo(d, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof(result), result, C_NULL)
         return tuple([Int(r) for r in result]...)
     end
@@ -1153,7 +1178,7 @@ function Base.getproperty(p::Program, s::Symbol)
         clGetProgramInfo(p, CL_PROGRAM_NUM_DEVICES, sizeof(Cuint), count, C_NULL)
         return Int(count[])
     elseif s == :devices
-        device_ids = Vector{cl_device_id}(undef, p.num_devices)
+        device_ids = Vector{cl_device_id}(undef, p.num_devices::Int)
         clGetProgramInfo(p, CL_PROGRAM_DEVICES, sizeof(device_ids), device_ids, C_NULL)
         return [Device(id) for id in device_ids]
     elseif s == :source
@@ -1164,11 +1189,11 @@ function Base.getproperty(p::Program, s::Symbol)
         clGetProgramInfo(p, CL_PROGRAM_SOURCE, src_len[], src, C_NULL)
         return GC.@preserve src unsafe_string(pointer(src))
     elseif s == :binary_sizes
-        sizes = Vector{Csize_t}(undef, p.num_devices)
+        sizes = Vector{Csize_t}(undef, p.num_devices::Int)
         clGetProgramInfo(p, CL_PROGRAM_BINARY_SIZES, sizeof(sizes), sizes, C_NULL)
         return sizes
     elseif s == :binaries
-        sizes = p.binary_sizes
+        sizes = p.binary_sizes::Vector{Csize_t}
 
         bins = Vector{Ptr{UInt8}}(undef, length(sizes))
         # keep a reference to the underlying binary arrays
@@ -1188,7 +1213,7 @@ function Base.getproperty(p::Program, s::Symbol)
 
         binary_dict = Dict{Device, Array{UInt8}}()
         bidx = 1
-        for (i, d) in enumerate(p.devices)
+        for (i, d) in enumerate(p.devices::Vector{Device})
             if sizes[i] > 0
                 binary_dict[d] = bin_arrays[bidx]
                 bidx += 1
@@ -1201,7 +1226,7 @@ function Base.getproperty(p::Program, s::Symbol)
         return Context(ctx[], retain = true)
     elseif s == :build_status
         status_dict = Dict{Device, cl_build_status}()
-        for device in p.devices
+        for device in p.devices::Vector{Device}
             status = Ref{cl_build_status}()
             clGetProgramBuildInfo(p, device, CL_PROGRAM_BUILD_STATUS, sizeof(cl_build_status), status, C_NULL)
             status_dict[device] = status[]
@@ -1209,7 +1234,7 @@ function Base.getproperty(p::Program, s::Symbol)
         return status_dict
     elseif s == :build_log
         log_dict = Dict{Device, String}()
-        for device in p.devices
+        for device in p.devices::Vector{Device}
             size = Ref{Csize_t}()
             clGetProgramBuildInfo(p, device, CL_PROGRAM_BUILD_LOG, 0, C_NULL, size)
             log = Vector{Cchar}(undef, size[])
@@ -1227,14 +1252,38 @@ mutable struct Kernel
     # kernel arguments are state of the kernel object, see `call`
     const lock::ReentrantLock
 
+    # the work-group limits for the session's device, which every launch needs. they don't
+    # change, so they are queried once (see `work_group_info` for the others)
+    const work_group_size::Int
+    const preferred_work_group_size_multiple::Int
+
     function Kernel(k::cl_kernel)
-        kernel = new(k, ReentrantLock())
+        function get(param)
+            result = Ref{Csize_t}()
+            clGetKernelWorkGroupInfo(k, device(), param, sizeof(Csize_t), result, C_NULL)
+            return Int(result[])
+        end
+        kernel = try
+            new(
+                k, ReentrantLock(), get(CL_KERNEL_WORK_GROUP_SIZE),
+                get(CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE)
+            )
+        catch
+            clReleaseKernel(k)
+            rethrow()
+        end
         finalizer(clReleaseKernel, kernel)
         return kernel
     end
 end
 
 Base.unsafe_convert(::Type{cl_kernel}, k::Kernel) = k.id
+
+function num_args(k::Kernel)
+    n = Ref{cl_uint}()
+    clGetKernelInfo(k, CL_KERNEL_NUM_ARGS, sizeof(cl_uint), n, C_NULL)
+    return Int(n[])
+end
 
 function Kernel(p::Program, kernel_name::String)
     for (dev, status) in p.build_status
@@ -1413,11 +1462,11 @@ function enqueue_kernel(
             num_sub_groups = KernelSubGroupInfo(k, device(), Csize_t[]).max_num_sub_groups
         end
         if nargs === nothing
-            nargs = k.num_args - 2
+            nargs = num_args(k) - 2
         end
-        rng_state_size = sizeof(UInt32) * num_sub_groups
-        set_arg!(k, nargs + 1, LocalMem(UInt32, rng_state_size))
-        set_arg!(k, nargs + 2, LocalMem(UInt32, rng_state_size))
+        # one UInt32 per sub-group
+        set_arg!(k, nargs + 1, LocalMem(UInt32, num_sub_groups))
+        set_arg!(k, nargs + 2, LocalMem(UInt32, num_sub_groups))
     end
 
     n_events = cl_uint(0)
@@ -1502,9 +1551,9 @@ function Base.getproperty(ki::KernelWorkGroupInfo, s::Symbol)
     k = getfield(ki, :kernel)
     d = getfield(ki, :device)
 
-    function get(val, typ)
-        result = Ref{typ}()
-        clGetKernelWorkGroupInfo(k, d, val, sizeof(typ), result, C_NULL)
+    function get(val, ::Type{T}) where {T}
+        result = Ref{T}()
+        clGetKernelWorkGroupInfo(k, d, val, sizeof(T), result, C_NULL)
         return result[]
     end
 
@@ -1536,9 +1585,9 @@ function Base.getproperty(ki::KernelSubGroupInfo, s::Symbol)
     d = getfield(ki, :device)
     lsize = getfield(ki, :local_work_size)
 
-    function get(val, typ)
-        result = Ref{typ}()
-        clGetKernelSubGroupInfo(k, d, val, sizeof(lsize), lsize, sizeof(typ), result, C_NULL)
+    function get(val, ::Type{T}) where {T}
+        result = Ref{T}()
+        clGetKernelSubGroupInfo(k, d, val, sizeof(lsize), lsize, sizeof(T), result, C_NULL)
         return result[]
     end
 

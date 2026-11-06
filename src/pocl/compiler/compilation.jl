@@ -3,6 +3,8 @@
 Base.@kwdef struct OpenCLCompilerParams <: AbstractCompilerParams
     # request a fixed sub-group width via `intel_reqd_sub_group_size`
     sub_group_size::Union{Nothing, Int} = nothing
+    # lower `muladd` to `fma` (see `muladd_method_table`)
+    fuse_muladd::Bool = false
 end
 
 const OpenCLCompilerConfig = CompilerConfig{SPIRVCompilerTarget, OpenCLCompilerParams}
@@ -36,7 +38,12 @@ end
 
 GPUCompiler.runtime_module(::CompilerJob{<:Any, OpenCLCompilerParams}) = POCL
 
-GPUCompiler.method_tables(::OpenCLCompilerJob) = (method_table, SPIRVIntrinsics.method_table)
+# SPIR-V doesn't support 128-bit integers, so keep 64-bit integer math (e.g. `Rational`
+# comparisons) that Base computes with them out of Int128
+GPUCompiler.method_tables(job::OpenCLCompilerJob) =
+    job.config.params.fuse_muladd ?
+    (muladd_method_table, method_table, SPIRVIntrinsics.method_table, GPUToolbox.Overlays.int128_overrides) :
+    (method_table, SPIRVIntrinsics.method_table, GPUToolbox.Overlays.int128_overrides)
 
 # filter out OpenCL built-ins
 # TODO: eagerly lower these using the translator API
@@ -212,9 +219,16 @@ end
     )
     supports_fp16 = "cl_khr_fp16" in dev.extensions
     supports_fp64 = "cl_khr_fp64" in dev.extensions
+    # `BFloat16` loads, stores and conversions. GPUCompiler widens the arithmetic to `float`,
+    # because PoCL doesn't accept any SPIR-V extension for bfloat16 arithmetic.
+    supports_bfloat16 = "SPV_KHR_bfloat16" in dev.spirv_extensions
 
     if sub_group_size !== nothing && sub_group_size ∉ dev.sub_group_sizes
         error("$sub_group_size is not a valid sub-group size for this device.")
+    end
+
+    if supports_bfloat16
+        extensions = extensions === nothing ? "+SPV_KHR_bfloat16" : "+SPV_KHR_bfloat16,$extensions"
     end
 
     # the vector shuffles of `KI.shfl_word_tuple` (see `POCLKernels`); `SPV_INTEL_subgroups`
@@ -225,12 +239,23 @@ end
 
     # create GPUCompiler objects
     target = SPIRVCompilerTarget(;
-        supports_fp16, supports_fp64, atomics,
+        supports_fp16, supports_fp64, supports_bfloat16, atomics,
         extensions = join(filter(!isempty, [default_extensions, something(extensions, "")]), ","),
         validate = true, kwargs...
     )
-    params = OpenCLCompilerParams(; sub_group_size)
+    params = OpenCLCompilerParams(; sub_group_size, fuse_muladd = fast_fma())
     return CompilerConfig(target, params; kernel, name, always_inline, debug_level)
+end
+
+# whether the CPU that PoCL runs kernels on, i.e., the host, executes `fma` in hardware, as
+# fast as a multiplication or addition. GPUCompiler's `have_fma` doesn't tell: on SPIR-V, it
+# holds whenever OpenCL's (correctly rounded) `fma` is available, possibly in software.
+function fast_fma()
+    Sys.ARCH === :aarch64 && return true
+    Sys.ARCH in (:x86_64, :i686) || return false
+    # LLVM's features of the host CPU, which PoCL compiles for
+    features = ccall(:jl_get_cpu_features, String, ())
+    return "+fma" in split(features, ',')
 end
 
 # The world in which this package was loaded. Running the compiler in that world reuses the
